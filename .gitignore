@@ -1,0 +1,34 @@
+# Simulation outputs — per-run JSON state, feeds, personas.
+# Content may be strategically sensitive; keep local.
+simulations/
+!simulations/.gitkeep
+
+# Drafts directory — not used unless creative_work_allowed flips on.
+drafts/
+!drafts/.gitkeep
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Bun / Node
+node_modules/
+bun.lock
+bun.lockb
+dist/
+build/
+*.log
+
+# Editor + OS cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.tmp
+
+# Claude Code per-machine settings
+.claude/settings.local.json
