@@ -7,6 +7,7 @@
 // Subcommands:
 //   run              Run a full simulation end-to-end.
 //   list-audiences   Show registered audience profiles.
+//   summarize        Generate a post-simulation summary from a completed state.json.
 //   help             Show usage.
 //
 // Configuration via environment:
@@ -27,6 +28,7 @@ import { generatePersonas } from "./personas";
 import { resolveProvider } from "./providers/registry";
 import type { LLMProvider, ChatMessage, ChatOptions } from "./providers/types";
 import { runSimulation } from "./simulation";
+import { summarizeSimulation } from "./summary";
 import type { AudienceProfile, SimulationState } from "./types";
 
 const REPO_ROOT = resolve(__dirname, "..");
@@ -44,6 +46,7 @@ function printUsage(): void {
 Usage:
   missionswarm run [flags]        Run a full simulation
   missionswarm list-audiences     Show available audience profiles
+  missionswarm summarize <sim>    Summarize a completed simulation
   missionswarm help               Show this message
 
 Flags for 'run':
@@ -71,7 +74,21 @@ Environment:
 Output:
   Per-simulation directory at <sims-dir>/<simulation-id>/ containing
   state.json. Reactions stream to stdout as JSON lines while the loop
-  runs; full state is persisted atomically after each round.`);
+  runs; full state is persisted atomically after each round.
+
+Flags for 'summarize':
+  <sim>                           REQUIRED. One of:
+                                    - simulation-id (looks in --sims-dir / MISSIONSWARM_SIMS_DIR)
+                                    - path to a simulation directory
+                                    - path to a state.json file
+  --model=<id>                    Override MISSIONSWARM_LLM_MODEL for this run.
+  --sims-dir=<path>               Where to resolve sim-ids (default: ./simulations
+                                  or MISSIONSWARM_SIMS_DIR).
+  --output=<path>                 Where to write summary.md (default:
+                                  <sim-dir>/summary.md).
+  --dry-run                       Use a canned summary — no LLM call. Useful for
+                                  verifying CLI wiring.
+  --stdout                        Also print the full summary to stdout.`);
 }
 
 async function main(): Promise<number> {
@@ -84,6 +101,8 @@ async function main(): Promise<number> {
       return runCmd(rest);
     case "list-audiences":
       return listAudiencesCmd();
+    case "summarize":
+      return summarizeCmd(rest);
     case "help":
     case "--help":
     case "-h":
@@ -252,6 +271,170 @@ async function listAudiencesCmd(): Promise<number> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// `summarize`
+// ─────────────────────────────────────────────────────────────
+
+interface SummarizeFlags {
+  positional?: string;
+  model?: string;
+  simsDir?: string;
+  output?: string;
+  dryRun: boolean;
+  alsoStdout: boolean;
+}
+
+function parseSummarizeFlags(argv: string[]): SummarizeFlags {
+  const f: SummarizeFlags = { dryRun: false, alsoStdout: false };
+  for (const arg of argv) {
+    if (arg === "--dry-run") { f.dryRun = true; continue; }
+    if (arg === "--stdout") { f.alsoStdout = true; continue; }
+    if (!arg.startsWith("--")) {
+      if (f.positional) {
+        console.error(`summarize: multiple positional args, ignoring ${arg}`);
+        continue;
+      }
+      f.positional = arg;
+      continue;
+    }
+    const eq = arg.indexOf("=");
+    if (eq < 0) {
+      console.error(`Unknown or malformed flag: ${arg}`);
+      continue;
+    }
+    const key = arg.slice(2, eq);
+    const val = arg.slice(eq + 1);
+    switch (key) {
+      case "model": f.model = val; break;
+      case "sims-dir": f.simsDir = val; break;
+      case "output": f.output = val; break;
+      default:
+        console.error(`Unknown flag: --${key}`);
+    }
+  }
+  return f;
+}
+
+/**
+ * Resolve the summarize positional arg into { statePath, simDir }.
+ *
+ * Accepts:
+ *   - a state.json file path → simDir = dirname
+ *   - a simulation directory path → statePath = <dir>/state.json
+ *   - a simulation id → statePath = <simsDir>/<id>/state.json
+ */
+async function resolveSimulationPaths(
+  positional: string,
+  simsDir: string,
+): Promise<{ statePath: string; simDir: string }> {
+  const { stat } = await import("node:fs/promises");
+
+  if (existsSync(positional)) {
+    const s = await stat(positional);
+    if (s.isFile()) {
+      return { statePath: positional, simDir: resolve(positional, "..") };
+    }
+    if (s.isDirectory()) {
+      const p = join(positional, "state.json");
+      if (!existsSync(p)) {
+        throw new Error(`No state.json in ${positional}`);
+      }
+      return { statePath: p, simDir: positional };
+    }
+  }
+
+  // Treat as sim-id
+  const candidate = join(simsDir, positional);
+  const statePath = join(candidate, "state.json");
+  if (!existsSync(statePath)) {
+    throw new Error(
+      `Cannot resolve '${positional}' as a sim-id, path, or file. ` +
+        `Looked at ${statePath} (sim-id resolution).`,
+    );
+  }
+  return { statePath, simDir: candidate };
+}
+
+async function summarizeCmd(argv: string[]): Promise<number> {
+  const flags = parseSummarizeFlags(argv);
+  if (!flags.positional) {
+    console.error("summarize: positional <sim> argument required");
+    console.error(
+      "Usage: missionswarm summarize <sim-id|sim-dir|state.json-path> [flags]",
+    );
+    return 2;
+  }
+
+  const simsDir = flags.simsDir ?? DEFAULT_SIMS_DIR;
+  let statePath: string;
+  let simDir: string;
+  try {
+    ({ statePath, simDir } = await resolveSimulationPaths(
+      flags.positional,
+      simsDir,
+    ));
+  } catch (e) {
+    console.error(`summarize: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+
+  const raw = await readFile(statePath, "utf8");
+  let state: SimulationState;
+  try {
+    state = JSON.parse(raw) as SimulationState;
+  } catch (e) {
+    console.error(
+      `summarize: failed to parse ${statePath}: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+    return 1;
+  }
+
+  if (state.status !== "complete") {
+    process.stderr.write(
+      `[missionswarm] warning: state.status is '${state.status}', ` +
+        `not 'complete'. Summarizing anyway — output may be partial.\n`,
+    );
+  }
+
+  const provider = flags.dryRun
+    ? createDryRunSummaryProvider(state)
+    : resolveProvider(flags.model ? { modelOverride: flags.model } : {});
+
+  process.stderr.write(
+    `[missionswarm] summarizing ${state.id} · ${state.personas.length} personas · ` +
+      `${state.rounds.length} rounds · provider=${provider.kind}${
+        flags.dryRun ? " (dry-run)" : ""
+      }\n`,
+  );
+
+  const summary = await summarizeSimulation(
+    state,
+    provider,
+    flags.model ? { model: flags.model } : {},
+  );
+
+  const outputPath = flags.output ?? join(simDir, "summary.md");
+  await writeAtomic(outputPath, summary);
+
+  process.stderr.write(`[missionswarm] summary written to ${outputPath}\n`);
+  if (flags.alsoStdout) {
+    process.stdout.write(summary);
+    if (!summary.endsWith("\n")) process.stdout.write("\n");
+  }
+
+  return 0;
+}
+
+async function writeAtomic(path: string, content: string): Promise<void> {
+  const { writeFile, rename, mkdir } = await import("node:fs/promises");
+  await mkdir(resolve(path, ".."), { recursive: true });
+  const tmp = `${path}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  await writeFile(tmp, content, "utf8");
+  await rename(tmp, path);
+}
+
+// ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
@@ -290,6 +473,21 @@ function generateSimulationId(): string {
 // Dry-run provider: canned persona + reaction responses.
 // Keeps end-to-end wiring testable without LLM access.
 // ─────────────────────────────────────────────────────────────
+
+function createDryRunSummaryProvider(state: SimulationState): LLMProvider {
+  return {
+    kind: "openrouter",
+    id: "dry-run-summary",
+    async *chat(): AsyncIterable<string> {
+      const personaList = state.personas
+        .map((p) => `- ${p.name}`)
+        .join("\n");
+      yield `## Input\n\n${state.resolved_input_doc.slice(0, 200)}${
+        state.resolved_input_doc.length > 200 ? "..." : ""
+      }\n\n## Reaction arc\n\n(dry-run) Canned summary. ${state.rounds.length} rounds recorded across ${state.personas.length} personas.\n\n## Active factions\n\n(dry-run) No clusters computed.\n\n## Notable voices\n\n${personaList}\n\n## Surprises\n\nNo significant stance drift against type this run.\n\n## Designer's takeaway\n\n(dry-run) Wiring verified; replace with live summarization for real output.\n`;
+    },
+  };
+}
 
 function createDryRunProvider(): LLMProvider {
   let callN = 0;
