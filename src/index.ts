@@ -7,6 +7,7 @@
 // Subcommands:
 //   run              Run a full simulation end-to-end.
 //   list-audiences   Show registered audience profiles.
+//   list-sims        Show completed / in-progress simulations in the sims dir.
 //   summarize        Generate a post-simulation summary from a completed state.json.
 //   help             Show usage.
 //
@@ -46,6 +47,7 @@ function printUsage(): void {
 Usage:
   missionswarm run [flags]        Run a full simulation
   missionswarm list-audiences     Show available audience profiles
+  missionswarm list-sims          Show past simulations in the sims dir
   missionswarm summarize <sim>    Summarize a completed simulation
   missionswarm help               Show this message
 
@@ -101,6 +103,8 @@ async function main(): Promise<number> {
       return runCmd(rest);
     case "list-audiences":
       return listAudiencesCmd();
+    case "list-sims":
+      return listSimsCmd(rest);
     case "summarize":
       return summarizeCmd(rest);
     case "help":
@@ -435,6 +439,148 @@ async function writeAtomic(path: string, content: string): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// `list-sims`
+// ─────────────────────────────────────────────────────────────
+
+interface SimListFlags {
+  simsDir?: string;
+}
+
+function parseListSimsFlags(argv: string[]): SimListFlags {
+  const f: SimListFlags = {};
+  for (const arg of argv) {
+    const eq = arg.indexOf("=");
+    if (!arg.startsWith("--") || eq < 0) {
+      console.error(`Unknown or malformed flag: ${arg}`);
+      continue;
+    }
+    const key = arg.slice(2, eq);
+    const val = arg.slice(eq + 1);
+    if (key === "sims-dir") f.simsDir = val;
+    else console.error(`Unknown flag: --${key}`);
+  }
+  return f;
+}
+
+interface SimRow {
+  id: string;
+  date: string;
+  audience: string;
+  agents: number;
+  rounds: number;
+  plannedRounds: number;
+  status: string;
+  hasSummary: boolean;
+}
+
+/**
+ * Read a sim directory, extract the display-relevant fields from
+ * state.json. Returns null if the dir doesn't contain a parseable
+ * state.json (caller filters these out silently).
+ */
+export async function readSimRow(simDir: string, id: string): Promise<SimRow | null> {
+  const statePath = join(simDir, "state.json");
+  if (!existsSync(statePath)) return null;
+  let state: SimulationState;
+  try {
+    const raw = await readFile(statePath, "utf8");
+    state = JSON.parse(raw) as SimulationState;
+  } catch {
+    return null;
+  }
+  if (!state.id || !state.audience?.id || !Array.isArray(state.rounds)) {
+    return null;
+  }
+  // Date heuristic: prefer started_at (ISO date prefix); fall back to
+  // the sim-id timestamp if the id has one; else show "(unknown)".
+  let date = "(unknown)";
+  if (typeof state.started_at === "string" && state.started_at.length >= 10) {
+    date = state.started_at.slice(0, 10);
+  } else {
+    const m = id.match(/\d{4}-\d{2}-\d{2}/);
+    if (m) date = m[0];
+  }
+  return {
+    id,
+    date,
+    audience: state.audience.id,
+    agents: state.personas.length,
+    rounds: state.rounds.length,
+    plannedRounds: state.config?.n_rounds ?? state.rounds.length,
+    status: state.status,
+    hasSummary: existsSync(join(simDir, "summary.md")),
+  };
+}
+
+export function formatSimRows(rows: SimRow[]): string {
+  if (rows.length === 0) return "No simulations found.";
+  const colWidths = {
+    id: Math.max(2, ...rows.map((r) => r.id.length)),
+    date: 10,
+    audience: Math.max(8, ...rows.map((r) => r.audience.length)),
+    size: 10,
+    status: Math.max(6, ...rows.map((r) => r.status.length)),
+  };
+  const lines: string[] = [];
+  lines.push(
+    [
+      "ID".padEnd(colWidths.id),
+      "DATE".padEnd(colWidths.date),
+      "AUDIENCE".padEnd(colWidths.audience),
+      "SIZE".padEnd(colWidths.size),
+      "STATUS".padEnd(colWidths.status),
+      "SUMMARY",
+    ].join("  "),
+  );
+  lines.push(
+    [
+      "-".repeat(colWidths.id),
+      "-".repeat(colWidths.date),
+      "-".repeat(colWidths.audience),
+      "-".repeat(colWidths.size),
+      "-".repeat(colWidths.status),
+      "-------",
+    ].join("  "),
+  );
+  for (const r of rows) {
+    const size = `${r.agents}p x ${r.rounds}/${r.plannedRounds}r`;
+    lines.push(
+      [
+        r.id.padEnd(colWidths.id),
+        r.date.padEnd(colWidths.date),
+        r.audience.padEnd(colWidths.audience),
+        size.padEnd(colWidths.size),
+        r.status.padEnd(colWidths.status),
+        r.hasSummary ? "yes" : "no",
+      ].join("  "),
+    );
+  }
+  return lines.join("\n");
+}
+
+async function listSimsCmd(argv: string[]): Promise<number> {
+  const flags = parseListSimsFlags(argv);
+  const simsDir = flags.simsDir ?? DEFAULT_SIMS_DIR;
+  if (!existsSync(simsDir)) {
+    console.log(`No simulations directory at ${simsDir}.`);
+    return 0;
+  }
+  const { readdir } = await import("node:fs/promises");
+  const entries = await readdir(simsDir, { withFileTypes: true });
+  const rows: SimRow[] = [];
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const row = await readSimRow(join(simsDir, e.name), e.name);
+    if (row) rows.push(row);
+  }
+  // Most recent first by date (string-sortable ISO prefix).
+  rows.sort((a, b) => b.date.localeCompare(a.date) || a.id.localeCompare(b.id));
+  console.log(`Simulations in ${simsDir}:\n`);
+  console.log(formatSimRows(rows));
+  return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
 
@@ -575,4 +721,13 @@ function cannedReaction(seed: number): unknown {
 // Kick off
 // ─────────────────────────────────────────────────────────────
 
-process.exit(await main());
+// Only run the CLI when this file is executed directly (not when
+// imported by tests or another module). `import.meta.main` is a Bun
+// primitive; falls back to the argv-matching heuristic elsewhere.
+const runAsScript =
+  (import.meta as { main?: boolean }).main === true ||
+  (typeof process !== "undefined" && process.argv[1]?.endsWith("index.ts"));
+
+if (runAsScript) {
+  process.exit(await main());
+}
