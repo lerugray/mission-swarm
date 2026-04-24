@@ -1,0 +1,69 @@
+# mission-swarm — hands-off manifest (ms-010)
+#
+# Paths listed here are off-limits for autonomous bot cycles. The
+# authoritative hands_off list for dispatcher verification lives in
+# GeneralStaff's projects.yaml (per-machine, gitignored); this file
+# is the project-local mirror so the bot prompt + contributors
+# reading the repo see the same list.
+#
+# Rationale is per-entry — if a bot cycle wants to edit one of these,
+# the task should be flagged interactive_only instead.
+
+hands_off:
+  # ─────── Voice-bearing prose ───────
+  - path: README.md
+    reason: Public-facing; Ray's voice.
+  - path: CLAUDE.md
+    reason: Project conventions + interactive-only design decisions.
+  - path: MISSION.md
+    reason: High-level goals + non-goals.
+
+  # ─────── Audience profiles (taste work) ───────
+  - path: audiences/
+    reason: >
+      Every word of persona_template_guidance matters for simulation
+      fidelity. New profiles + edits to existing ones are taste work,
+      not bot scope.
+
+  # ─────── Prompt strings embedded in code ───────
+  - path: src/summary.ts
+    reason: >
+      Contains SUMMARY_SYSTEM_PROMPT — the single source of truth for
+      post-simulation-summary voice. Bot can add sibling helpers if
+      needed; not edit this file.
+  - path: src/personas.ts
+    reason: >
+      Contains persona-generation prompt. Voice-bearing. Bot can add
+      sibling helpers; not edit this file.
+
+  # ─────── Foundational type design ───────
+  - path: src/types.ts
+    reason: >
+      Changing SimulationState / Persona / Reaction shape breaks
+      every consumer. Extensions need Ray's call.
+
+  # ─────── Design + session docs ───────
+  - path: docs/
+    reason: Ray's authorship. Includes design docs + future Markov-analysis plans.
+
+  # ─────── Bot infrastructure (self-modification guard) ───────
+  - path: engineer_command.sh
+    reason: The bot's own launcher. Only Ray modifies.
+  - path: hands_off.yaml
+    reason: The bot's own hands-off list. Only Ray modifies.
+  - path: package.json
+    reason: Dep additions are taste calls. Lockfile auto-updates via install are fine.
+  - path: tsconfig.json
+    reason: Type-strictness config affects every file.
+  - path: .gitignore
+    reason: Routine maintenance but not bot scope.
+  - path: .claude/
+    reason: Per-machine Claude config + skills.
+
+# Follow-up worth considering:
+# Extract SUMMARY_SYSTEM_PROMPT (src/summary.ts) and the persona-gen
+# prompt (src/personas.ts) into separate src/prompts/*.txt files.
+# Then the bot could edit the logic while the prompts stay immutable
+# — narrows hands_off from whole-file to the prompt strings
+# themselves. Not blocking ms-010; queue as ms-011 if bot cycles hit
+# friction against the file-level restriction.
