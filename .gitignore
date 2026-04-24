@@ -32,3 +32,11 @@ Thumbs.db
 
 # Claude Code per-machine settings
 .claude/settings.local.json
+
+# Claude Design artifacts — preview HTML + React code land here on
+# extract; not repo content (kept as local reference + mirrored to
+# private-generalstaff/design-payloads/ for cross-machine access).
+claude-design-output/
+claude-design-output-markov/
+mission-swarm.zip
+missionswarmmarkov.zip
