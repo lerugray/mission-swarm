@@ -126,5 +126,5 @@ on your disk, your keys for paid providers, no SaaS layer.
 - **[mission-brain](https://github.com/lerugray/mission-brain)**:
   retrieval-only second brain over your own writing, citation-
   grounded.
-- **[mission-bullet](https://github.com/lerugray/mission-bullet)**:
+- **[mission-bullet-oss](https://github.com/lerugray/mission-bullet-oss)**:
   AI-assisted bullet journal in the Ryder Carroll method.
