@@ -1,5 +1,7 @@
 # MissionSwarm
 
+![mission-swarm — What would your audience say? Open Source · BYOK · Kriegspiel Ready](docs/images/banner.png)
+
 A lightweight swarm-simulation engine: feed it a document (press release,
 event summary, news article, campaign brief) and it generates a set of
 personas whose reactions, disagreements, and opinion drift unfold round
