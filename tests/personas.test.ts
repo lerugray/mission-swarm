@@ -2,8 +2,8 @@
 //
 // Uses a mock LLMProvider to exercise parsing, retry, and ID
 // assignment without burning real tokens. Live provider testing
-// is a separate (manual, Ray-driven) validation step — the
-// prompt-tuning taste call ms-003 flags.
+// is a separate (manual) validation step — the prompt-tuning
+// taste call ms-003 flags.
 
 import { describe, expect, test } from "bun:test";
 import { generatePersonas, PersonaGenerationError } from "../src/personas";

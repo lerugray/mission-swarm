@@ -184,10 +184,10 @@ export interface Round {
  * profile; the persona generator consumes it to produce the
  * initial persona set.
  *
- * Profiles live on disk at `audiences/<id>.json`. Ray's kriegspiel
- * profile is the v1 flagship (ms-005). Profiles are read-only at
- * simulation time — if the guidance needs updating, write a new
- * profile file with a new id.
+ * Profiles live on disk at `audiences/<id>.json`. The shipped
+ * kriegspiel profile is the v1 flagship (ms-005). Profiles are
+ * read-only at simulation time — if the guidance needs updating,
+ * write a new profile file with a new id.
  */
 export interface AudienceProfile {
   id: string;

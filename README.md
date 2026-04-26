@@ -11,16 +11,17 @@ JSON-per-simulation.
 
 ## What it is
 
-The ~20% of MiroShark that's useful for Ray's kriegspiel-simulation
-direction, rebuilt from scratch as a standalone tool. MiroShark
+The lean ~20% of MiroShark that's useful for kriegspiel and
+product-launch reaction simulation, rebuilt from scratch as a
+standalone tool. MiroShark
 (`github.com/aaronjmars/MiroShark`) ships a research-grade knowledge-
 graph stack, multi-platform simulation (Twitter / Reddit / Polymarket),
 belief-state tracking, and a ReACT reporting agent — powerful but
 heavy enough that running it locally without a good GPU is painful.
 
-MissionSwarm keeps the part Ray actually wants — plausible persona
-reactions to input content, streamable live — and drops everything
-else. The kriegspiel framing: when a wargame or strategic-scenario
+MissionSwarm keeps the part most users actually want — plausible
+persona reactions to input content, streamable live — and drops
+everything else. The kriegspiel framing: when a wargame or strategic-scenario
 project needs "how does the domestic / foreign / media audience react
 to this event?", MissionSwarm answers in a form the broader simulation
 can consume.

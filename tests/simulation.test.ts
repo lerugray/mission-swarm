@@ -3,8 +3,8 @@
 // Exercises the simulation loop against a mock provider so the
 // round-by-round state transitions, delta application, failure
 // policy, and JSON-parse recovery can all be verified without
-// burning real tokens. Live-LLM validation is a separate (Ray-
-// driven) step.
+// burning real tokens. Live-LLM validation is a separate manual
+// step.
 
 import { describe, expect, test, beforeEach } from "bun:test";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
