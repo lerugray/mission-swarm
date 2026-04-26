@@ -2,10 +2,12 @@
 //
 // For R rounds: for each persona, one LLM call producing
 // { text, stance_delta, interest_delta }. Within a round, all
-// personas run in parallel (Promise.all) but see only the
-// PREVIOUS round's feed — no cross-persona bleeding inside a
-// round. After all reactions in round N are recorded, state
-// persists atomically and round N+1 starts.
+// personas run in parallel but see only the PREVIOUS round's feed —
+// no cross-persona bleeding inside a round. Reactions stream to
+// consumers as each LLM call completes (Promise.race), while
+// persisted round state sorts reactions by persona order for stable
+// diffs. After each round, state persists atomically and round N+1
+// starts.
 //
 // Streaming: reactions emit a single "reaction-complete" JSON line
 // to stdout as they settle so an operator watching can follow the
@@ -33,8 +35,8 @@ import { ProviderError } from "./providers/types";
 import type {
   Persona,
   Reaction,
+  ReactionEvent,
   Round,
-  SimulationConfig,
   SimulationState,
   Topic,
 } from "./types";
@@ -46,6 +48,12 @@ let reactionEmitter: (reaction: Reaction) => void = defaultEmit;
 export function setReactionEmitter(fn: (reaction: Reaction) => void): void {
   reactionEmitter = fn;
 }
+
+/** Restore stdout JSON lines of {@link Reaction} (used after CLI overrides). */
+export function resetReactionEmitter(): void {
+  reactionEmitter = defaultEmit;
+}
+
 function defaultEmit(reaction: Reaction): void {
   process.stdout.write(JSON.stringify(reaction) + "\n");
 }
@@ -55,6 +63,27 @@ export class SimulationError extends Error {
     super(message);
     this.name = "SimulationError";
   }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §0 ReactionEvent mapping (stream / CLI)
+// ─────────────────────────────────────────────────────────────
+
+export function reactionToReactionEvent(
+  reaction: Reaction,
+  personas: Persona[],
+): ReactionEvent {
+  const p = personas.find((x) => x.id === reaction.persona_id);
+  const ev: ReactionEvent = {
+    round: reaction.round_n,
+    persona_name: p?.name ?? reaction.persona_id,
+    reaction: reaction.text,
+    stance_delta: reaction.stance_delta,
+  };
+  if (Object.keys(reaction.interest_delta).length > 0) {
+    ev.interest_delta = reaction.interest_delta;
+  }
+  return ev;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -77,9 +106,14 @@ export interface RunSimulationInput {
   chatOptions?: ChatOptions;
 }
 
-export async function runSimulation(
+/**
+ * Async generator: yields each {@link Reaction} the moment that persona's
+ * LLM call completes (completion order), then returns the final
+ * {@link SimulationState} when the run ends (complete or failed).
+ */
+export async function* iterateSimulation(
   input: RunSimulationInput,
-): Promise<SimulationState> {
+): AsyncGenerator<Reaction, SimulationState> {
   const feedWindow = Math.max(1, input.feedWindowRounds ?? 3);
   let state: SimulationState = {
     ...input.state,
@@ -91,36 +125,58 @@ export async function runSimulation(
     const startedAt = nowISO();
     const feed = buildFeedWindow(state.rounds, feedWindow);
 
-    const settled = await Promise.all(
-      state.personas.map((persona) =>
-        runOnePersonaReaction(persona, n, feed, state, input.provider, input.chatOptions),
-      ),
+    const pending = new Map(
+      state.personas.map((persona) => {
+        const pr = runOnePersonaReaction(
+          persona,
+          n,
+          feed,
+          state,
+          input.provider,
+          input.chatOptions,
+        ).then((out) => ({ persona, out }));
+        return [persona.id, pr] as const;
+      }),
     );
 
-    const reactions: Reaction[] = [];
-    let failures = 0;
-    for (const r of settled) {
-      if (r.ok) {
-        reactions.push(r.value);
-        reactionEmitter(r.value);
+    const completionOrder: Reaction[] = [];
+    let failCount = 0;
+    let lastErrMsg = "unknown";
+
+    while (pending.size > 0) {
+      const winner = await Promise.race(
+        [...pending.entries()].map(([id, pr]) =>
+          pr.then((v) => ({ id, ...v })),
+        ),
+      );
+      pending.delete(winner.id);
+      if (winner.out.ok) {
+        completionOrder.push(winner.out.value);
+        yield winner.out.value;
       } else {
-        failures++;
-        logReactionFailure(n, r.persona_id, r.error);
+        failCount++;
+        logReactionFailure(n, winner.out.persona_id, winner.out.error);
+        lastErrMsg = winner.out.error.message;
       }
     }
 
-    if (failures === state.personas.length) {
+    if (failCount === state.personas.length) {
       state = {
         ...state,
         status: "failed",
         completed_at: nowISO(),
         failure_reason:
-          `All ${failures} personas failed in round ${n}. Last error: ` +
-          String((settled.find((s) => !s.ok) as any)?.error?.message ?? "unknown"),
+          `All ${failCount} personas failed in round ${n}. Last error: ${lastErrMsg}`,
       };
       await persistState(input.simulationsDir, state);
       return state;
     }
+
+    const orderIdx = new Map(state.personas.map((p, i) => [p.id, i]));
+    const reactions = [...completionOrder].sort(
+      (a, b) =>
+        (orderIdx.get(a.persona_id) ?? 0) - (orderIdx.get(b.persona_id) ?? 0),
+    );
 
     const round: Round = {
       number: n,
@@ -136,6 +192,7 @@ export async function runSimulation(
       personas: personasAfter,
     };
     await persistState(input.simulationsDir, state);
+    await persistRoundJson(input.simulationsDir, state.id, round);
   }
 
   state = {
@@ -145,6 +202,19 @@ export async function runSimulation(
   };
   await persistState(input.simulationsDir, state);
   return state;
+}
+
+export async function runSimulation(
+  input: RunSimulationInput,
+): Promise<SimulationState> {
+  const gen = iterateSimulation(input);
+  while (true) {
+    const step = await gen.next();
+    if (step.done) {
+      return step.value;
+    }
+    reactionEmitter(step.value);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -431,6 +501,17 @@ export async function persistState(
   const dir = join(simulationsDir, state.id);
   const path = join(dir, "state.json");
   await atomicWriteJson(path, state);
+  return path;
+}
+
+export async function persistRoundJson(
+  simulationsDir: string,
+  simId: string,
+  round: Round,
+): Promise<string> {
+  const dir = join(simulationsDir, simId);
+  const path = join(dir, `round-${round.number}.json`);
+  await atomicWriteJson(path, round);
   return path;
 }
 

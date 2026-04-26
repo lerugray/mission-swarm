@@ -270,17 +270,28 @@ function shapeRawPersona(obj: unknown, idx: number): ShapeResult {
   }
   const stance = shapeTopicMap(o.stance, idx, "stance");
   if (!stance.ok) return stance;
-  const interest = shapeTopicMap(o.interest, idx, "interest");
+  const interestSource = o.interest ?? o.interests;
+  const interest = shapeTopicMap(interestSource, idx, "interest");
   if (!interest.ok) return interest;
 
-  if (!Array.isArray(o.style_markers)) {
+  const markersField =
+    o.style_markers ??
+    (typeof o.style === "string"
+      ? [o.style]
+      : Array.isArray(o.style)
+        ? o.style
+        : undefined);
+
+  if (!Array.isArray(markersField)) {
     return {
       ok: false,
-      error: new Error(`Element ${idx}: 'style_markers' must be an array`),
+      error: new Error(
+        `Element ${idx}: 'style_markers' (or 'style') must be an array or string`,
+      ),
     };
   }
   const markers: string[] = [];
-  for (const m of o.style_markers) {
+  for (const m of markersField) {
     if (typeof m !== "string") {
       return {
         ok: false,

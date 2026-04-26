@@ -2,9 +2,8 @@
 //
 // Ported from mission-bullet's proven pattern (mb-002). Differences
 // from mission-bullet:
-//  - Only two provider kinds: "openrouter", "ollama". mission-bullet
-//    also had "claude" (local Claude Code CLI) + "dry-run"; ms may
-//    add those later but they're out of v1 scope.
+//  - Provider kinds: "openrouter", "ollama", plus optional "claude"
+//    (local Claude Code CLI subprocess) for subscription users.
 //  - Default-provider preference inverted: mission-bullet prefers
 //    Ollama-first for personal-data privacy. MissionSwarm prefers
 //    OpenRouter-first because simulations are not personal data and
@@ -20,11 +19,12 @@
 // surface while later ones are still generating shortens perceived
 // latency.
 
-export type ProviderKind = "openrouter" | "ollama";
+export type ProviderKind = "openrouter" | "ollama" | "claude";
 
 export const VALID_PROVIDER_KINDS: readonly ProviderKind[] = [
   "openrouter",
   "ollama",
+  "claude",
 ];
 
 export type ChatRole = "system" | "user" | "assistant";

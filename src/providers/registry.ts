@@ -13,9 +13,10 @@
 // personal data; OpenRouter-first gives simulations reliable cloud
 // throughput without local-GPU cost.
 
+import { createClaudeCliProvider } from "./claude";
 import { createOllamaProvider } from "./ollama";
 import { createOpenRouterProvider } from "./openrouter";
-import { ProviderError, type LLMProvider } from "./types";
+import { ProviderError, type LLMProvider, type ProviderKind } from "./types";
 
 export interface ProviderResolveOptions {
   /** Override the MISSIONSWARM_LLM_MODEL env value. */
@@ -25,7 +26,7 @@ export interface ProviderResolveOptions {
    * Useful for tests that want Ollama even when OPENROUTER_API_KEY
    * is set.
    */
-  forceKind?: "openrouter" | "ollama";
+  forceKind?: ProviderKind;
 }
 
 export function resolveProvider(opts: ProviderResolveOptions = {}): LLMProvider {
@@ -34,6 +35,10 @@ export function resolveProvider(opts: ProviderResolveOptions = {}): LLMProvider 
 
   const openrouterKey = env.OPENROUTER_API_KEY?.trim();
   const ollamaBase = env.OLLAMA_BASE_URL?.trim();
+
+  if (opts.forceKind === "claude") {
+    return createClaudeCliProvider({});
+  }
 
   const wantOpenRouter =
     opts.forceKind === "openrouter" ||

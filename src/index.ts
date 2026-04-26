@@ -24,18 +24,45 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import { generatePersonas } from "./personas";
 import { resolveProvider } from "./providers/registry";
-import type { LLMProvider, ChatMessage, ChatOptions } from "./providers/types";
-import { runSimulation } from "./simulation";
+import type {
+  LLMProvider,
+  ChatMessage,
+  ChatOptions,
+  ProviderKind,
+} from "./providers/types";
+import { VALID_PROVIDER_KINDS } from "./providers/types";
+import {
+  reactionToReactionEvent,
+  resetReactionEmitter,
+  runSimulation,
+  setReactionEmitter,
+} from "./simulation";
 import { summarizeSimulation } from "./summary";
-import type { AudienceProfile, SimulationState } from "./types";
+import type {
+  AudienceProfile,
+  Reaction,
+  ReactionEvent,
+  SimulationState,
+} from "./types";
 
 const REPO_ROOT = resolve(__dirname, "..");
 const DEFAULT_AUDIENCES_DIR = join(REPO_ROOT, "audiences");
 const DEFAULT_SIMS_DIR =
   process.env.MISSIONSWARM_SIMS_DIR ?? join(REPO_ROOT, "simulations");
+
+const KNOWN_SUBCOMMANDS = new Set([
+  "run",
+  "list-audiences",
+  "list-sims",
+  "summarize",
+  "help",
+]);
+
+type OutputMode = "stream" | "json" | "sse";
 
 // ─────────────────────────────────────────────────────────────
 // Usage + main dispatcher
@@ -58,14 +85,19 @@ Flags for 'run':
   --audience=<id>                 Audience profile id (see list-audiences).
                                   REQUIRED.
   --agents=<n>                    Number of personas to generate. Default: 12.
+  --personas=<n>                  Alias for --agents.
   --rounds=<n>                    Number of reaction rounds. Default: 5.
   --model=<id>                    Override MISSIONSWARM_LLM_MODEL for this run.
+  --provider=<k>                  openrouter | ollama | claude (default: env-based).
+  --output-mode=<m>               stream (default) | json | sse — stdout encoding.
   --output=<dir>                  Override simulations output directory
                                   (default: ./simulations or
                                   MISSIONSWARM_SIMS_DIR).
   --feed-window=<n>               Rounds of prior feed each persona sees. Default: 3.
   --dry-run                       Use a canned-response mock provider. No LLM calls.
   --simulation-id=<id>            Override generated simulation id (advanced).
+
+  Shorthand: missionswarm <input-doc> --audience=<id> ...  (implicit 'run')
 
 Environment:
   OPENROUTER_API_KEY              Cloud LLM provider (default preference).
@@ -75,8 +107,10 @@ Environment:
 
 Output:
   Per-simulation directory at <sims-dir>/<simulation-id>/ containing
-  state.json. Reactions stream to stdout as JSON lines while the loop
-  runs; full state is persisted atomically after each round.
+  state.json and round-N.json per completed round. Reactions stream to
+  stdout (default: one ReactionEvent JSON object per line). json mode
+  buffers all events and prints a single array when the run finishes.
+  sse mode emits Server-Sent Events frames.
 
 Flags for 'summarize':
   <sim>                           REQUIRED. One of:
@@ -93,10 +127,43 @@ Flags for 'summarize':
   --stdout                        Also print the full summary to stdout.`);
 }
 
+function printRunHelp(): void {
+  console.log(`missionswarm run — full simulation
+
+Required:
+  --input=<path-or-text>     Input document (file path or inline text)
+  --audience=<id>            Audience profile id (audiences/<id>.yaml|.json)
+
+Common:
+  --personas=<n> | --agents=<n>   Persona count (default 12)
+  --rounds=<n>               Reaction rounds (default 5)
+  --provider=openrouter|ollama|claude
+  --model=<id>               Model id for the selected provider
+  --output-mode=stream|json|sse
+  --output=<dir>             simulations/ output directory
+  --feed-window=<n>        Prior rounds visible in the feed (default 3)
+  --simulation-id=<id>     Override generated run id
+  --dry-run                  Mock LLM responses (no API keys)
+
+Shorthand:
+  missionswarm <input-doc> --audience=<id> [same flags as above]
+
+See 'missionswarm help' for global environment variables.`);
+}
+
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
-  const sub = argv[0];
-  const rest = argv.slice(1);
+  let sub = argv[0];
+  let rest = argv.slice(1);
+
+  if (
+    sub !== undefined &&
+    !sub.startsWith("-") &&
+    !KNOWN_SUBCOMMANDS.has(sub)
+  ) {
+    rest = [`--input=${sub}`, ...rest];
+    sub = "run";
+  }
 
   switch (sub) {
     case "run":
@@ -134,6 +201,14 @@ interface RunFlags {
   feedWindow: number;
   dryRun: boolean;
   simulationId?: string;
+  provider?: ProviderKind;
+  outputMode: OutputMode;
+}
+
+function parseOutputMode(raw: string): OutputMode | null {
+  const v = raw.trim().toLowerCase();
+  if (v === "stream" || v === "json" || v === "sse") return v;
+  return null;
 }
 
 function parseRunFlags(argv: string[]): RunFlags {
@@ -142,9 +217,13 @@ function parseRunFlags(argv: string[]): RunFlags {
     rounds: 5,
     feedWindow: 3,
     dryRun: false,
+    outputMode: "stream",
   };
   for (const arg of argv) {
-    if (arg === "--dry-run") { f.dryRun = true; continue; }
+    if (arg === "--dry-run") {
+      f.dryRun = true;
+      continue;
+    }
     const eq = arg.indexOf("=");
     if (!arg.startsWith("--") || eq < 0) {
       console.error(`Unknown or malformed flag: ${arg}`);
@@ -153,14 +232,51 @@ function parseRunFlags(argv: string[]): RunFlags {
     const key = arg.slice(2, eq);
     const val = arg.slice(eq + 1);
     switch (key) {
-      case "input": f.input = val; break;
-      case "audience": f.audience = val; break;
-      case "agents": f.agents = Math.max(1, parseInt(val, 10) || 0); break;
-      case "rounds": f.rounds = Math.max(1, parseInt(val, 10) || 0); break;
-      case "model": f.model = val; break;
-      case "output": f.output = val; break;
-      case "feed-window": f.feedWindow = Math.max(1, parseInt(val, 10) || 0); break;
-      case "simulation-id": f.simulationId = val; break;
+      case "input":
+        f.input = val;
+        break;
+      case "audience":
+        f.audience = val;
+        break;
+      case "agents":
+      case "personas":
+        f.agents = Math.max(1, parseInt(val, 10) || 0);
+        break;
+      case "rounds":
+        f.rounds = Math.max(1, parseInt(val, 10) || 0);
+        break;
+      case "model":
+        f.model = val;
+        break;
+      case "output":
+        f.output = val;
+        break;
+      case "feed-window":
+        f.feedWindow = Math.max(1, parseInt(val, 10) || 0);
+        break;
+      case "simulation-id":
+        f.simulationId = val;
+        break;
+      case "provider": {
+        const k = val.trim().toLowerCase() as ProviderKind;
+        if (!(VALID_PROVIDER_KINDS as readonly string[]).includes(k)) {
+          console.error(
+            `Unknown --provider=${val} (expected ${VALID_PROVIDER_KINDS.join(", ")})`,
+          );
+          break;
+        }
+        f.provider = k;
+        break;
+      }
+      case "output-mode": {
+        const m = parseOutputMode(val);
+        if (!m) {
+          console.error(`Unknown --output-mode=${val} (expected stream, json, sse)`);
+          break;
+        }
+        f.outputMode = m;
+        break;
+      }
       default:
         console.error(`Unknown flag: --${key}`);
     }
@@ -169,6 +285,11 @@ function parseRunFlags(argv: string[]): RunFlags {
 }
 
 async function runCmd(argv: string[]): Promise<number> {
+  if (argv[0] === "--help" || argv[0] === "-h") {
+    printRunHelp();
+    return 0;
+  }
+
   const flags = parseRunFlags(argv);
   if (!flags.input) {
     console.error("run: --input is required");
@@ -179,63 +300,99 @@ async function runCmd(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const inputText = await resolveInputText(flags.input);
-  const audience = await loadAudience(flags.audience);
-  const provider = flags.dryRun
-    ? createDryRunProvider()
-    : resolveProvider(flags.model ? { modelOverride: flags.model } : {});
-  const simulationsDir = flags.output ?? DEFAULT_SIMS_DIR;
-  const simulationId = flags.simulationId ?? generateSimulationId();
+  const jsonBuffer: ReactionEvent[] = [];
 
-  process.stderr.write(
-    `[missionswarm] starting sim ${simulationId} · audience=${audience.id} · ` +
-      `agents=${flags.agents} · rounds=${flags.rounds} · ` +
-      `provider=${provider.kind}${flags.dryRun ? " (dry-run)" : ""}\n`,
-  );
+  try {
+    const inputText = await resolveInputText(flags.input);
+    const audience = await loadAudience(flags.audience);
+    const provider = flags.dryRun
+      ? createDryRunProvider()
+      : resolveProvider({
+          ...(flags.model ? { modelOverride: flags.model } : {}),
+          ...(flags.provider ? { forceKind: flags.provider } : {}),
+        });
+    const simulationsDir = flags.output ?? DEFAULT_SIMS_DIR;
+    const simulationId = flags.simulationId ?? generateSimulationId();
 
-  const personas = await generatePersonas({
-    simulationId,
-    audience,
-    inputDoc: inputText,
-    nAgents: flags.agents,
-    provider,
-  });
+    process.stderr.write(
+      `[missionswarm] starting sim ${simulationId} · audience=${audience.id} · ` +
+        `agents=${flags.agents} · rounds=${flags.rounds} · ` +
+        `provider=${provider.kind}${flags.dryRun ? " (dry-run)" : ""} · ` +
+        `output-mode=${flags.outputMode}\n`,
+    );
 
-  process.stderr.write(
-    `[missionswarm] personas generated (${personas.length}) · starting rounds\n`,
-  );
+    const personas = await generatePersonas({
+      simulationId,
+      audience,
+      inputDoc: inputText,
+      nAgents: flags.agents,
+      provider,
+      ...(flags.model ? { chatOptions: { model: flags.model } } : {}),
+    });
 
-  const config = {
-    input_doc: flags.input,
-    audience_profile_id: audience.id,
-    n_agents: flags.agents,
-    n_rounds: flags.rounds,
-    ...(flags.model ? { llm_model: flags.model } : {}),
-  };
-  const baseState: SimulationState = {
-    id: simulationId,
-    config,
-    audience,
-    resolved_input_doc: inputText,
-    personas,
-    rounds: [],
-    status: "pending",
-    started_at: new Date().toISOString(),
-  };
+    process.stderr.write(
+      `[missionswarm] personas generated (${personas.length}) · starting rounds\n`,
+    );
 
-  const final = await runSimulation({
-    state: baseState,
-    provider,
-    simulationsDir,
-    feedWindowRounds: flags.feedWindow,
-  });
+    const emitForMode = (r: Reaction) => {
+      const ev = reactionToReactionEvent(r, personas);
+      if (flags.outputMode === "json") {
+        jsonBuffer.push(ev);
+        return;
+      }
+      const line = JSON.stringify(ev);
+      if (flags.outputMode === "sse") {
+        process.stdout.write(`event: reaction\ndata: ${line}\n\n`);
+      } else {
+        process.stdout.write(`${line}\n`);
+      }
+    };
 
-  process.stderr.write(
-    `[missionswarm] ${final.status} · ${final.rounds.length}/${flags.rounds} rounds · ` +
-      `state: ${join(simulationsDir, simulationId, "state.json")}\n`,
-  );
+    setReactionEmitter(emitForMode);
 
-  return final.status === "failed" ? 1 : 0;
+    const config = {
+      input_doc: flags.input,
+      audience_profile_id: audience.id,
+      n_agents: flags.agents,
+      n_rounds: flags.rounds,
+      ...(flags.model ? { llm_model: flags.model } : {}),
+    };
+    const baseState: SimulationState = {
+      id: simulationId,
+      config,
+      audience,
+      resolved_input_doc: inputText,
+      personas,
+      rounds: [],
+      status: "pending",
+      started_at: new Date().toISOString(),
+    };
+
+    const chatOptions: ChatOptions | undefined = flags.model
+      ? { model: flags.model }
+      : undefined;
+
+    const final = await runSimulation({
+      state: baseState,
+      provider,
+      simulationsDir,
+      feedWindowRounds: flags.feedWindow,
+      ...(chatOptions ? { chatOptions } : {}),
+    });
+
+    if (flags.outputMode === "json") {
+      process.stdout.write(JSON.stringify(jsonBuffer) + "\n");
+    }
+
+    process.stderr.write(
+      `[missionswarm] ${final.status} · ${final.rounds.length}/${flags.rounds} rounds · ` +
+        `state: ${join(simulationsDir, simulationId, "state.json")}\n`,
+    );
+
+    return final.status === "failed" ? 1 : 0;
+  } finally {
+    resetReactionEmitter();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -250,12 +407,33 @@ async function listAudiencesCmd(): Promise<number> {
   }
   const { readdir } = await import("node:fs/promises");
   const entries = await readdir(dir);
-  const profiles: AudienceProfile[] = [];
+  const preferredPathByStem = new Map<string, { path: string; pri: number }>();
   for (const e of entries) {
-    if (!e.endsWith(".json")) continue;
+    let stem: string;
+    let pri: number;
+    if (e.endsWith(".yaml")) {
+      stem = e.slice(0, -".yaml".length);
+      pri = 2;
+    } else if (e.endsWith(".yml")) {
+      stem = e.slice(0, -".yml".length);
+      pri = 1;
+    } else if (e.endsWith(".json")) {
+      stem = e.slice(0, -".json".length);
+      pri = 0;
+    } else {
+      continue;
+    }
+    const path = join(dir, e);
+    const cur = preferredPathByStem.get(stem);
+    if (!cur || pri > cur.pri) preferredPathByStem.set(stem, { path, pri });
+  }
+  const profiles: AudienceProfile[] = [];
+  for (const { path } of preferredPathByStem.values()) {
     try {
-      const raw = await readFile(join(dir, e), "utf8");
-      const p = JSON.parse(raw) as AudienceProfile;
+      const raw = await readFile(path, "utf8");
+      const p = (
+        path.endsWith(".json") ? JSON.parse(raw) : parseYaml(raw)
+      ) as AudienceProfile;
       if (p.id && p.name) profiles.push(p);
     } catch {
       // skip malformed
@@ -592,14 +770,26 @@ async function resolveInputText(inputArg: string): Promise<string> {
 }
 
 async function loadAudience(id: string): Promise<AudienceProfile> {
-  const path = join(DEFAULT_AUDIENCES_DIR, `${id}.json`);
-  if (!existsSync(path)) {
+  const base = join(DEFAULT_AUDIENCES_DIR, id);
+  const candidates = [`${base}.yaml`, `${base}.yml`, `${base}.json`];
+  let path: string | null = null;
+  let raw = "";
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      path = p;
+      raw = await readFile(p, "utf8");
+      break;
+    }
+  }
+  if (!path) {
     throw new Error(
-      `Audience profile '${id}' not found at ${path}. Run 'missionswarm list-audiences' to see available profiles.`,
+      `Audience profile '${id}' not found (tried .yaml, .yml, .json under ${DEFAULT_AUDIENCES_DIR}). ` +
+        `Run 'missionswarm list-audiences' to see available profiles.`,
     );
   }
-  const raw = await readFile(path, "utf8");
-  const parsed = JSON.parse(raw) as AudienceProfile;
+  const parsed = (
+    path.endsWith(".json") ? JSON.parse(raw) : parseYaml(raw)
+  ) as AudienceProfile;
   if (!parsed.id || !parsed.name || !parsed.persona_template_guidance) {
     throw new Error(
       `Audience profile at ${path} is missing required fields (id, name, persona_template_guidance)`,
