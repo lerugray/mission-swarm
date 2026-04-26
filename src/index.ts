@@ -72,36 +72,37 @@ function printUsage(): void {
   console.log(`MissionSwarm — swarm-reaction simulation engine
 
 Usage:
-  missionswarm run [flags]        Run a full simulation
-  missionswarm list-audiences     Show available audience profiles
-  missionswarm list-sims          Show past simulations in the sims dir
-  missionswarm summarize <sim>    Summarize a completed simulation
-  missionswarm help               Show this message
+  bun src/index.ts run [flags]           Run a full simulation
+  bun src/index.ts list-audiences        Show available audience profiles
+  bun src/index.ts list-sims             Show past simulations in the sims dir
+  bun src/index.ts summarize <sim>       Summarize a completed simulation
+  bun src/index.ts help                  Show this message
 
-Flags for 'run':
-  --input=<path-or-text>          Input document: file path OR inline text.
+Flags for 'run' (--key=value or --key value):
+  --input <path-or-text>          Input document: file path OR inline text.
                                   Paths tried first; if not a file, treated as text.
                                   REQUIRED.
-  --audience=<id>                 Audience profile id (see list-audiences).
+  --audience <id>                 Audience profile id (see list-audiences).
                                   REQUIRED.
-  --agents=<n>                    Number of personas to generate. Default: 12.
-  --personas=<n>                  Alias for --agents.
-  --rounds=<n>                    Number of reaction rounds. Default: 5.
-  --model=<id>                    Override MISSIONSWARM_LLM_MODEL for this run.
-  --provider=<k>                  openrouter | ollama | claude (default: env-based).
-  --output-mode=<m>               stream (default) | json | sse — stdout encoding.
-  --output=<dir>                  Override simulations output directory
+  --agents <n>                    Number of personas to generate. Default: 12.
+  --personas <n>                  Alias for --agents.
+  --rounds <n>                    Number of reaction rounds. Default: 5.
+  --model <id>                    Override MISSIONSWARM_LLM_MODEL for this run.
+  --provider <k>                  openrouter | ollama | claude (default: openrouter).
+                                  Pass --provider ollama for local-only runs.
+  --output-mode <m>               stream (default) | json | sse — stdout encoding.
+  --output <dir>                  Override simulations output directory
                                   (default: ./simulations or
                                   MISSIONSWARM_SIMS_DIR).
-  --feed-window=<n>               Rounds of prior feed each persona sees. Default: 3.
+  --feed-window <n>               Rounds of prior feed each persona sees. Default: 3.
   --dry-run                       Use a canned-response mock provider. No LLM calls.
-  --simulation-id=<id>            Override generated simulation id (advanced).
+  --simulation-id <id>            Override generated simulation id (advanced).
 
-  Shorthand: missionswarm <input-doc> --audience=<id> ...  (implicit 'run')
+  Shorthand: bun src/index.ts <input-doc> --audience <id> ...  (implicit 'run')
 
 Environment:
-  OPENROUTER_API_KEY              Cloud LLM provider (default preference).
-  OLLAMA_BASE_URL                 Local LLM provider (fallback).
+  OPENROUTER_API_KEY              Cloud LLM provider (default when --provider omitted).
+  OLLAMA_BASE_URL                 Local LLM provider (use with --provider ollama).
   MISSIONSWARM_LLM_MODEL          Model id (required for OpenRouter).
   MISSIONSWARM_SIMS_DIR           Simulations output directory.
 
@@ -128,27 +129,30 @@ Flags for 'summarize':
 }
 
 function printRunHelp(): void {
-  console.log(`missionswarm run — full simulation
+  console.log(`bun src/index.ts run — full simulation
 
 Required:
-  --input=<path-or-text>     Input document (file path or inline text)
-  --audience=<id>            Audience profile id (audiences/<id>.yaml|.json)
+  --input <path-or-text>     Input document (file path or inline text)
+  --audience <id>            Audience profile id (audiences/<id>.yaml|.json)
 
 Common:
-  --personas=<n> | --agents=<n>   Persona count (default 12)
-  --rounds=<n>               Reaction rounds (default 5)
-  --provider=openrouter|ollama|claude
-  --model=<id>               Model id for the selected provider
-  --output-mode=stream|json|sse
-  --output=<dir>             simulations/ output directory
-  --feed-window=<n>        Prior rounds visible in the feed (default 3)
-  --simulation-id=<id>     Override generated run id
+  --personas <n> | --agents <n>   Persona count (default 12)
+  --rounds <n>               Reaction rounds (default 5)
+  --provider openrouter|ollama|claude   (default: openrouter)
+  --model <id>               Model id for the selected provider
+  --output-mode stream|json|sse
+  --output <dir>             simulations/ output directory
+  --feed-window <n>          Prior rounds visible in the feed (default 3)
+  --simulation-id <id>       Override generated run id
   --dry-run                  Mock LLM responses (no API keys)
 
-Shorthand:
-  missionswarm <input-doc> --audience=<id> [same flags as above]
+Example:
+  bun src/index.ts ./brief.md --audience tech-dev --rounds 2 --personas 3 --dry-run
 
-See 'missionswarm help' for global environment variables.`);
+Shorthand:
+  bun src/index.ts <input-doc> --audience <id> [same flags]
+
+See 'bun src/index.ts help' for global environment variables.`);
 }
 
 async function main(): Promise<number> {
@@ -211,6 +215,10 @@ function parseOutputMode(raw: string): OutputMode | null {
   return null;
 }
 
+/**
+ * Parse `run` argv. Supports `--key=value` and `--key value` (value must not
+ * start with `--`). Boolean `--dry-run` has no value.
+ */
 function parseRunFlags(argv: string[]): RunFlags {
   const f: RunFlags = {
     agents: 12,
@@ -219,49 +227,106 @@ function parseRunFlags(argv: string[]): RunFlags {
     dryRun: false,
     outputMode: "stream",
   };
-  for (const arg of argv) {
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
     if (arg === "--dry-run") {
       f.dryRun = true;
       continue;
     }
-    const eq = arg.indexOf("=");
-    if (!arg.startsWith("--") || eq < 0) {
-      console.error(`Unknown or malformed flag: ${arg}`);
+    if (!arg.startsWith("--")) {
+      console.error(`Unknown argument: ${arg}`);
       continue;
     }
-    const key = arg.slice(2, eq);
-    const val = arg.slice(eq + 1);
+
+    let key: string;
+    let val: string | undefined;
+    const eq = arg.indexOf("=");
+    if (eq >= 0) {
+      key = arg.slice(2, eq);
+      val = arg.slice(eq + 1);
+    } else {
+      key = arg.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        val = next;
+        i++;
+      }
+    }
+
     switch (key) {
       case "input":
-        f.input = val;
+        if (val === undefined || val === "") {
+          console.error("--input requires a value (path or inline text)");
+        } else {
+          f.input = val;
+        }
         break;
       case "audience":
-        f.audience = val;
+        if (val === undefined || val === "") {
+          console.error("--audience requires a value (profile id)");
+        } else {
+          f.audience = val;
+        }
         break;
       case "agents":
-      case "personas":
-        f.agents = Math.max(1, parseInt(val, 10) || 0);
+      case "personas": {
+        if (val === undefined || val === "") {
+          console.error(`--${key} requires a number`);
+          break;
+        }
+        const n = parseInt(val, 10);
+        f.agents = Math.max(1, Number.isFinite(n) ? n : 0);
         break;
-      case "rounds":
-        f.rounds = Math.max(1, parseInt(val, 10) || 0);
+      }
+      case "rounds": {
+        if (val === undefined || val === "") {
+          console.error("--rounds requires a number");
+          break;
+        }
+        const n = parseInt(val, 10);
+        f.rounds = Math.max(1, Number.isFinite(n) ? n : 0);
         break;
+      }
       case "model":
-        f.model = val;
+        if (val === undefined) {
+          console.error("--model requires a value");
+        } else {
+          f.model = val;
+        }
         break;
       case "output":
-        f.output = val;
+        if (val === undefined || val === "") {
+          console.error("--output requires a directory path");
+        } else {
+          f.output = val;
+        }
         break;
-      case "feed-window":
-        f.feedWindow = Math.max(1, parseInt(val, 10) || 0);
+      case "feed-window": {
+        if (val === undefined || val === "") {
+          console.error("--feed-window requires a number");
+          break;
+        }
+        const n = parseInt(val, 10);
+        f.feedWindow = Math.max(1, Number.isFinite(n) ? n : 0);
         break;
+      }
       case "simulation-id":
-        f.simulationId = val;
+        if (val === undefined || val === "") {
+          console.error("--simulation-id requires a value");
+        } else {
+          f.simulationId = val;
+        }
         break;
       case "provider": {
+        if (val === undefined || val === "") {
+          console.error("--provider requires openrouter, ollama, or claude");
+          break;
+        }
         const k = val.trim().toLowerCase() as ProviderKind;
         if (!(VALID_PROVIDER_KINDS as readonly string[]).includes(k)) {
           console.error(
-            `Unknown --provider=${val} (expected ${VALID_PROVIDER_KINDS.join(", ")})`,
+            `Unknown --provider ${val} (expected ${VALID_PROVIDER_KINDS.join(", ")})`,
           );
           break;
         }
@@ -269,9 +334,13 @@ function parseRunFlags(argv: string[]): RunFlags {
         break;
       }
       case "output-mode": {
+        if (val === undefined || val === "") {
+          console.error("--output-mode requires stream, json, or sse");
+          break;
+        }
         const m = parseOutputMode(val);
         if (!m) {
-          console.error(`Unknown --output-mode=${val} (expected stream, json, sse)`);
+          console.error(`Unknown --output-mode ${val} (expected stream, json, sse)`);
           break;
         }
         f.outputMode = m;
@@ -309,10 +378,11 @@ async function runCmd(argv: string[]): Promise<number> {
       ? createDryRunProvider()
       : resolveProvider({
           ...(flags.model ? { modelOverride: flags.model } : {}),
-          ...(flags.provider ? { forceKind: flags.provider } : {}),
+          forceKind: flags.provider ?? "openrouter",
         });
     const simulationsDir = flags.output ?? DEFAULT_SIMS_DIR;
-    const simulationId = flags.simulationId ?? generateSimulationId();
+    const simulationId =
+      flags.simulationId ?? generateSimulationId(audience.id);
 
     process.stderr.write(
       `[missionswarm] starting sim ${simulationId} · audience=${audience.id} · ` +
@@ -541,7 +611,7 @@ async function summarizeCmd(argv: string[]): Promise<number> {
   if (!flags.positional) {
     console.error("summarize: positional <sim> argument required");
     console.error(
-      "Usage: missionswarm summarize <sim-id|sim-dir|state.json-path> [flags]",
+      "Usage: bun src/index.ts summarize <sim-id|sim-dir|state.json-path> [flags]",
     );
     return 2;
   }
@@ -784,7 +854,7 @@ async function loadAudience(id: string): Promise<AudienceProfile> {
   if (!path) {
     throw new Error(
       `Audience profile '${id}' not found (tried .yaml, .yml, .json under ${DEFAULT_AUDIENCES_DIR}). ` +
-        `Run 'missionswarm list-audiences' to see available profiles.`,
+        `Run 'bun src/index.ts list-audiences' to see available profiles.`,
     );
   }
   const parsed = (
@@ -798,11 +868,21 @@ async function loadAudience(id: string): Promise<AudienceProfile> {
   return parsed;
 }
 
-function generateSimulationId(): string {
+function slugifyAudienceId(id: string): string {
+  return id
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "audience";
+}
+
+function generateSimulationId(audienceId?: string): string {
   const now = new Date();
   const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const rand = Math.random().toString(36).slice(2, 8);
-  return `sim-${stamp}-${rand}`;
+  const slug = audienceId ? slugifyAudienceId(audienceId) : "run";
+  return `sim-${slug}-${stamp}-${rand}`;
 }
 
 // ─────────────────────────────────────────────────────────────

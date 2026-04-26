@@ -1,8 +1,9 @@
 // MissionSwarm — round loop public surface (Phase 2).
 //
-// Re-exports streaming iteration + helpers. Programmatic embedders
-// can use {@link runReactionLoop} with a bare input document + persona
-// list without going through the full CLI state builder.
+// {@link runSimulation} streams {@link ReactionEvent} per completed LLM
+// reaction (completion order within each round). For draining the loop
+// while forwarding reactions to stdout, use {@link runSimulation} in
+// simulation.ts (Promise-returning consumer) instead.
 
 import type { ChatOptions, LLMProvider } from "./providers/types";
 import type { AudienceProfile, Persona, ReactionEvent, SimulationState } from "./types";
@@ -21,7 +22,8 @@ export {
   type RunSimulationInput,
 } from "./simulation";
 
-export interface RunReactionLoopOptions {
+/** Options for {@link runSimulation} (streaming reaction loop). */
+export interface RunSimulationStreamOptions {
   provider: LLMProvider;
   simulationsDir: string;
   simulationId: string;
@@ -32,16 +34,24 @@ export interface RunReactionLoopOptions {
   inputDocLabel?: string;
 }
 
+/** @deprecated Use {@link RunSimulationStreamOptions}. */
+export type RunReactionLoopOptions = RunSimulationStreamOptions;
+
 /**
  * Run the reaction loop from a resolved document + persona set.
  * Yields {@link ReactionEvent} per completed LLM reaction; returns final
  * {@link SimulationState} when the generator completes.
+ *
+ * Note: `simulation.ts` also exports a `runSimulation` function that
+ * returns `Promise<SimulationState>` and forwards each reaction to the
+ * global emitter. This `runSimulation` is the async-iterable API for
+ * embedders.
  */
-export async function* runReactionLoop(
+export async function* runSimulation(
   inputDoc: string,
   personas: Persona[],
   rounds: number,
-  options: RunReactionLoopOptions,
+  options: RunSimulationStreamOptions,
 ): AsyncGenerator<ReactionEvent, SimulationState> {
   const state: SimulationState = {
     id: options.simulationId,
@@ -78,3 +88,6 @@ export async function* runReactionLoop(
     yield reactionToReactionEvent(step.value, state.personas);
   }
 }
+
+/** @deprecated Use {@link runSimulation}. */
+export const runReactionLoop = runSimulation;
