@@ -16,15 +16,15 @@ product-launch reaction simulation, rebuilt from scratch as a
 standalone tool. MiroShark
 (`github.com/aaronjmars/MiroShark`) ships a research-grade knowledge-
 graph stack, multi-platform simulation (Twitter / Reddit / Polymarket),
-belief-state tracking, and a ReACT reporting agent — powerful but
+belief-state tracking, and a ReACT reporting agent. Powerful, but
 heavy enough that running it locally without a good GPU is painful.
 
-MissionSwarm keeps the part most users actually want — plausible
-persona reactions to input content, streamable live — and drops
-everything else. The kriegspiel framing: when a wargame or strategic-scenario
-project needs "how does the domestic / foreign / media audience react
-to this event?", MissionSwarm answers in a form the broader simulation
-can consume.
+MissionSwarm keeps the part most users actually want: plausible
+persona reactions to input content, streamable live, and drops
+everything else. The kriegspiel framing: when a wargame or
+strategic-scenario project needs "how does the domestic / foreign /
+media audience react to this event?", MissionSwarm answers in a form
+the broader simulation can consume.
 
 ## What it is not (v1 scope boundaries)
 
@@ -43,16 +43,16 @@ needed by real use, graduate it. Default is to stay small.
 
 ## Intended use cases
 
-- **Kriegspiel / wargame reactions** — domestic political factions,
+- **Kriegspiel / wargame reactions.** Domestic political factions,
   foreign observers, military commentators, media outlets reacting to
   in-game events or real-world scenario briefings. Primary v1 target.
-- **Product-release reaction simulation** — how might the wargame
+- **Product-release reaction simulation.** How might the wargame
   community react to an AMFIOG announcement? The pixel-art community
   to a Retrogaze pivot? Press-release smoke-test.
-- **General "public reacts to X"** — untargeted audience sampling
-  against any input document.
+- **General "public reacts to X"** sampling against any input
+  document.
 
-Audience profiles are pluggable — a config file per domain lives in
+Audience profiles are pluggable. A config file per domain lives in
 `audiences/` and shapes persona generation for that domain.
 
 ## Architecture (planned)
@@ -72,9 +72,10 @@ Input document + audience profile + config
    (optional) Summary report
 ```
 
-State persistence: each simulation writes to `simulations/<id>/` —
-config, persona list, per-round feed, stance trajectories. `simulations/`
-is gitignored; only the code + `audiences/` templates are tracked.
+State persistence: each simulation writes to `simulations/<id>/`
+(config, persona list, per-round feed, stance trajectories).
+`simulations/` is gitignored; only the code + `audiences/` templates
+are tracked.
 
 ## Relationship to GeneralStaff
 
@@ -87,17 +88,22 @@ same way it tracks every other registered project.
 Future option: a GS plugin surface could let GS-registered projects
 declare `uses: [mission-swarm]` and auto-invoke MissionSwarm at
 natural points (e.g., before a release task, generate a reactions
-simulation). Out of scope for v1 — flag for later.
+simulation). Out of scope for v1; flag for later.
 
 ## Privacy posture
 
-Private repo at `github.com/lerugray/mission-swarm`. Simulation outputs
-in `simulations/` stay local (gitignored) — they may contain domain-
-sensitive strategic content. Audience profile templates in `audiences/`
-are tracked because they're reusable shape definitions, not
-project-specific content.
+Simulation outputs in `simulations/` stay on disk and gitignored.
+They may contain domain-sensitive strategic content (pre-launch
+announcement drafts, scenario briefs), so the directory is excluded
+from version control by default. Audience profile templates in
+`audiences/` are tracked because they're reusable shape definitions,
+not project-specific content.
 
-## Setup (when actually built)
+Bring-your-own-keys for paid providers. mission-swarm uploads input
+only when you've configured a cloud provider via `.env`. The Ollama
+path runs fully local; nothing leaves your machine on that path.
+
+## Setup
 
 ```bash
 git clone https://github.com/lerugray/mission-swarm.git
@@ -107,5 +113,16 @@ cp .env.example .env   # configure OPENROUTER_API_KEY or Ollama endpoint
 bun src/index.ts --help
 ```
 
-v0.0.0 scaffold lands first; actual implementation follows in a
-dedicated session.
+## Sibling tools
+
+Three other open-source tools share this repo's posture: your data
+on your disk, your keys for paid providers, no SaaS layer.
+
+- **[GeneralStaff](https://github.com/lerugray/generalstaff)**:
+  multi-project bot orchestrator with hands-off enforcement and
+  audit logging.
+- **[mission-brain](https://github.com/lerugray/mission-brain)**:
+  retrieval-only second brain over your own writing, citation-
+  grounded.
+- **[mission-bullet](https://github.com/lerugray/mission-bullet)**:
+  AI-assisted bullet journal in the Ryder Carroll method.
