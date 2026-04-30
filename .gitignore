@@ -40,3 +40,12 @@ claude-design-output/
 claude-design-output-markov/
 mission-swarm.zip
 missionswarmmarkov.zip
+
+# GS state junction (private-state safety; defensive add 2026-04-30 per
+# cross-project gitignore audit. The state/<id>/ junction may not exist
+# locally yet, but if a bot cycle or Cursor session creates it later,
+# git add -A would otherwise leak private MISSION.md / tasks.json content).
+state/
+
+# GS dispatcher per-project worktree — bot scratch space, never tracked.
+.bot-worktree/
