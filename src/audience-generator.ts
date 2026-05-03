@@ -30,6 +30,10 @@ import { ProviderError } from "./providers/types";
 
 const MAX_RETRIES = 1; // 2 total attempts
 const MIN_GUIDANCE_LENGTH = 800;
+// Audience generation produces ~1500 output tokens of structured prose.
+// The provider default of 60s (tuned for ~500-token persona reactions)
+// is too tight — flagship models routinely take 90-150s for this size.
+const DEFAULT_TIMEOUT_MS = 180_000;
 
 export class AudienceGenerationError extends Error {
   constructor(message: string, public cause?: unknown) {
@@ -73,13 +77,17 @@ export async function generateAudience(
   }
 
   const messages = buildAudiencePrompt(input, nGroups);
+  const chatOptions: ChatOptions = {
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    ...input.chatOptions,
+  };
 
   let lastRaw = "";
   let lastErr: unknown;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     let raw: string;
     try {
-      raw = await collectResponse(input.provider, messages, input.chatOptions);
+      raw = await collectResponse(input.provider, messages, chatOptions);
     } catch (err) {
       if (err instanceof ProviderError) {
         throw new AudienceGenerationError(
