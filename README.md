@@ -55,7 +55,12 @@ needed by real use, graduate it. Default is to stay small.
   document.
 
 Audience profiles are pluggable. A config file per domain lives in
-`audiences/` and shapes persona generation for that domain.
+`audiences/` and shapes persona generation for that domain. Three ship
+in v1 — `kriegspiel`, `gaming-community`, `tech-dev`. Generate your
+own from a short description with `bun src/index.ts new-audience
+--id <id> --description "<who they are>"`; the generator uses the
+existing audiences as few-shot examples and writes a new
+`audiences/<id>.json` ready to use.
 
 ## Architecture (planned)
 

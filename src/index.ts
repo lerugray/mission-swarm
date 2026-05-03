@@ -9,6 +9,7 @@
 //   list-audiences   Show registered audience profiles.
 //   list-sims        Show completed / in-progress simulations in the sims dir.
 //   summarize        Generate a post-simulation summary from a completed state.json.
+//   new-audience     Generate a new audience profile from a description (LLM-assisted).
 //   help             Show usage.
 //
 // Configuration via environment:
@@ -26,6 +27,7 @@ import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
+import { generateAudience } from "./audience-generator";
 import { generatePersonas } from "./personas";
 import { resolveProvider } from "./providers/registry";
 import type {
@@ -59,6 +61,7 @@ const KNOWN_SUBCOMMANDS = new Set([
   "list-audiences",
   "list-sims",
   "summarize",
+  "new-audience",
   "help",
 ]);
 
@@ -72,11 +75,12 @@ function printUsage(): void {
   console.log(`MissionSwarm — swarm-reaction simulation engine
 
 Usage:
-  bun src/index.ts run [flags]           Run a full simulation
-  bun src/index.ts list-audiences        Show available audience profiles
-  bun src/index.ts list-sims             Show past simulations in the sims dir
-  bun src/index.ts summarize <sim>       Summarize a completed simulation
-  bun src/index.ts help                  Show this message
+  bun src/index.ts run [flags]               Run a full simulation
+  bun src/index.ts list-audiences            Show available audience profiles
+  bun src/index.ts list-sims                 Show past simulations in the sims dir
+  bun src/index.ts summarize <sim>           Summarize a completed simulation
+  bun src/index.ts new-audience [flags]      Generate a new audience profile (LLM-assisted)
+  bun src/index.ts help                      Show this message
 
 Flags for 'run' (--key=value or --key value):
   --input <path-or-text>          Input document: file path OR inline text.
@@ -125,7 +129,21 @@ Flags for 'summarize':
                                   <sim-dir>/summary.md).
   --dry-run                       Use a canned summary — no LLM call. Useful for
                                   verifying CLI wiring.
-  --stdout                        Also print the full summary to stdout.`);
+  --stdout                        Also print the full summary to stdout.
+
+Flags for 'new-audience':
+  --id <id>                       REQUIRED. Slug-form id; becomes filename + audience id.
+                                  Non-alphanumeric chars converted to hyphens.
+  --description <text>            REQUIRED. Plain-English description of the audience.
+                                  Goes into the prompt verbatim.
+  --groups <n>                    Target template-group count. Default: 4.
+  --provider <k>                  openrouter | ollama | claude (default: openrouter).
+  --model <id>                    Override MISSIONSWARM_LLM_MODEL for this run.
+  --output <dir>                  Write to <dir>/<id>.json (default: ./audiences).
+  --exemplars <n>                 Reference audiences to include as few-shot
+                                  (default: up to 3 from the audiences dir).
+  --force                         Overwrite an existing <id>.json without prompting.
+  --dry-run                       Use a canned response (stub guidance) — no LLM call.`);
 }
 
 function printRunHelp(): void {
@@ -178,6 +196,8 @@ async function main(): Promise<number> {
       return listSimsCmd(rest);
     case "summarize":
       return summarizeCmd(rest);
+    case "new-audience":
+      return newAudienceCmd(rest);
     case "help":
     case "--help":
     case "-h":
@@ -684,6 +704,255 @@ async function writeAtomic(path: string, content: string): Promise<void> {
   const tmp = `${path}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   await writeFile(tmp, content, "utf8");
   await rename(tmp, path);
+}
+
+// ─────────────────────────────────────────────────────────────
+// `new-audience`
+// ─────────────────────────────────────────────────────────────
+
+interface NewAudienceFlags {
+  id?: string;
+  description?: string;
+  groups: number;
+  model?: string;
+  provider?: ProviderKind;
+  output?: string;
+  exemplars: number;
+  force: boolean;
+  dryRun: boolean;
+}
+
+function parseNewAudienceFlags(argv: string[]): NewAudienceFlags {
+  const f: NewAudienceFlags = {
+    groups: 4,
+    exemplars: 3,
+    force: false,
+    dryRun: false,
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--dry-run") { f.dryRun = true; continue; }
+    if (arg === "--force") { f.force = true; continue; }
+    if (!arg.startsWith("--")) {
+      console.error(`Unknown argument: ${arg}`);
+      continue;
+    }
+
+    let key: string;
+    let val: string | undefined;
+    const eq = arg.indexOf("=");
+    if (eq >= 0) {
+      key = arg.slice(2, eq);
+      val = arg.slice(eq + 1);
+    } else {
+      key = arg.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        val = next;
+        i++;
+      }
+    }
+
+    switch (key) {
+      case "id":
+        if (!val) console.error("--id requires a value");
+        else f.id = val;
+        break;
+      case "description":
+        if (!val) console.error("--description requires a value");
+        else f.description = val;
+        break;
+      case "groups": {
+        if (!val) { console.error("--groups requires a number"); break; }
+        const n = parseInt(val, 10);
+        f.groups = Math.max(1, Number.isFinite(n) ? n : 0);
+        break;
+      }
+      case "exemplars": {
+        if (!val) { console.error("--exemplars requires a number"); break; }
+        const n = parseInt(val, 10);
+        f.exemplars = Math.max(0, Number.isFinite(n) ? n : 0);
+        break;
+      }
+      case "model":
+        if (val === undefined) console.error("--model requires a value");
+        else f.model = val;
+        break;
+      case "output":
+        if (!val) console.error("--output requires a directory path");
+        else f.output = val;
+        break;
+      case "provider": {
+        if (!val) {
+          console.error("--provider requires openrouter, ollama, or claude");
+          break;
+        }
+        const k = val.trim().toLowerCase() as ProviderKind;
+        if (!(VALID_PROVIDER_KINDS as readonly string[]).includes(k)) {
+          console.error(
+            `Unknown --provider ${val} (expected ${VALID_PROVIDER_KINDS.join(", ")})`,
+          );
+          break;
+        }
+        f.provider = k;
+        break;
+      }
+      default:
+        console.error(`Unknown flag: --${key}`);
+    }
+  }
+  return f;
+}
+
+/**
+ * Load up to `max` AudienceProfiles from `dir` to use as few-shot
+ * exemplars. Skips any profile whose id matches `excludeId` (so an
+ * overwrite-with-force doesn't include the stale version of itself
+ * in the prompt).
+ */
+async function loadExemplars(
+  dir: string,
+  max: number,
+  excludeId?: string,
+): Promise<AudienceProfile[]> {
+  if (max <= 0 || !existsSync(dir)) return [];
+  const { readdir } = await import("node:fs/promises");
+  const entries = await readdir(dir);
+  const preferredPathByStem = new Map<string, { path: string; pri: number }>();
+  for (const e of entries) {
+    let stem: string;
+    let pri: number;
+    if (e.endsWith(".yaml")) { stem = e.slice(0, -5); pri = 2; }
+    else if (e.endsWith(".yml")) { stem = e.slice(0, -4); pri = 1; }
+    else if (e.endsWith(".json")) { stem = e.slice(0, -5); pri = 0; }
+    else continue;
+    if (excludeId && stem === excludeId) continue;
+    const path = join(dir, e);
+    const cur = preferredPathByStem.get(stem);
+    if (!cur || pri > cur.pri) preferredPathByStem.set(stem, { path, pri });
+  }
+  const sortedPaths = [...preferredPathByStem.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([, v]) => v.path);
+  const profiles: AudienceProfile[] = [];
+  for (const path of sortedPaths) {
+    if (profiles.length >= max) break;
+    try {
+      const raw = await readFile(path, "utf8");
+      const p = (
+        path.endsWith(".json") ? JSON.parse(raw) : parseYaml(raw)
+      ) as AudienceProfile;
+      if (p.id && p.name && p.persona_template_guidance) profiles.push(p);
+    } catch {
+      // skip malformed
+    }
+  }
+  return profiles;
+}
+
+async function newAudienceCmd(argv: string[]): Promise<number> {
+  const flags = parseNewAudienceFlags(argv);
+  if (!flags.id) {
+    console.error("new-audience: --id is required");
+    return 2;
+  }
+  if (!flags.description) {
+    console.error("new-audience: --description is required");
+    return 2;
+  }
+
+  const id = slugifyAudienceId(flags.id);
+  const outDir = flags.output ?? DEFAULT_AUDIENCES_DIR;
+  const outPath = join(outDir, `${id}.json`);
+
+  if (existsSync(outPath) && !flags.force) {
+    console.error(
+      `new-audience: ${outPath} already exists. Re-run with --force to overwrite.`,
+    );
+    return 1;
+  }
+
+  const exemplars = await loadExemplars(
+    DEFAULT_AUDIENCES_DIR,
+    flags.exemplars,
+    id,
+  );
+  const provider = flags.dryRun
+    ? createDryRunAudienceProvider(id, flags.description)
+    : resolveProvider({
+        ...(flags.model ? { modelOverride: flags.model } : {}),
+        forceKind: flags.provider ?? "openrouter",
+      });
+
+  process.stderr.write(
+    `[missionswarm] generating audience '${id}' · groups=${flags.groups} · ` +
+      `exemplars=${exemplars.length}/${flags.exemplars} · ` +
+      `provider=${provider.kind}${flags.dryRun ? " (dry-run)" : ""}\n`,
+  );
+
+  let profile: AudienceProfile;
+  try {
+    profile = await generateAudience({
+      id,
+      description: flags.description,
+      nGroups: flags.groups,
+      exemplars,
+      provider,
+      ...(flags.model ? { chatOptions: { model: flags.model } } : {}),
+    });
+  } catch (e) {
+    console.error(
+      `new-audience: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return 1;
+  }
+
+  await writeAtomic(outPath, JSON.stringify(profile, null, 2) + "\n");
+  process.stderr.write(`[missionswarm] wrote ${outPath}\n`);
+  process.stderr.write(
+    `[missionswarm] try it: bun src/index.ts run --input <doc> --audience ${id}\n`,
+  );
+  return 0;
+}
+
+function createDryRunAudienceProvider(
+  id: string,
+  description: string,
+): LLMProvider {
+  return {
+    kind: "openrouter",
+    id: "dry-run-audience",
+    async *chat(): AsyncIterable<string> {
+      const stub = {
+        id,
+        name: `${id} (dry-run)`,
+        description,
+        persona_template_guidance:
+          `Generate personas for: ${description}\n\n` +
+          "TEMPLATE GROUPS\n\n" +
+          "1. Group A (target ~25%) — placeholder description for the first " +
+          "template group. Real audiences would carry specific role + voice + " +
+          "stance details here. This is dry-run output for CLI wiring tests.\n\n" +
+          "2. Group B (target ~25%) — placeholder description for the second " +
+          "template group with similar shape and length to Group A so the " +
+          "generated stub clears the minimum-length validation gate.\n\n" +
+          "3. Group C (target ~25%) — placeholder description for the third " +
+          "template group. Same shape, real audiences fill in concrete details " +
+          "about who these personas are and what makes their voice distinct.\n\n" +
+          "4. Group D (target ~25%) — placeholder description for the fourth " +
+          "template group, rounding out the four-group default shape.\n\n" +
+          "CRAFT RULES\n\n" +
+          "- Names should sound like real people of the relevant background.\n" +
+          "- Bios (2–4 sentences) should carry concrete details — role, era, " +
+          "  affiliation, key priors. The bio is the prompt context for every round.\n" +
+          "- Stances should vary meaningfully within every template group.\n" +
+          "- Style markers should be concrete — voice cues a downstream reader " +
+          "  could quote, not abstract descriptors.\n",
+      };
+      yield JSON.stringify(stub);
+    },
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
