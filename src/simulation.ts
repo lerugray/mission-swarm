@@ -278,32 +278,39 @@ async function runOnePersonaReaction(
 // §3 Prompt construction
 // ─────────────────────────────────────────────────────────────
 
-function buildReactionPrompt(
-  persona: Persona,
-  roundN: number,
-  feed: string,
-  state: SimulationState,
-): ChatMessage[] {
-  const system =
-    "You are one participant in a swarm simulation. Your identity is fixed — " +
-    "you react AS this persona, in this persona's voice. You see the input " +
-    "document and the recent reactions of other participants (the feed). " +
-    "You do NOT see other participants' private stance or interest deltas.\n\n" +
-    "Each round you emit ONE reaction: a short statement in your voice " +
-    "(1–4 sentences, plausibly something this persona might say in " +
-    "response to the current state of play), plus sparse stance and interest " +
-    "updates on topics you chose to move on this round.\n\n" +
-    "Output STRICT JSON. A single object. No markdown code fence. No prose " +
-    "before or after. Keys:\n" +
-    '  text: string — your reaction in your voice\n' +
-    '  stance_delta: object — topic → delta in −1..+1. Sparse: only topics ' +
-    'you meaningfully moved. Omit topics you did not move. Values are DELTAS, ' +
-    'not absolute.\n' +
-    '  interest_delta: object — same topic keys or new ones, → delta in −1..+1. ' +
-    'Same sparse semantics.\n\n' +
-    "Voice guidance: stay in character. Don't say \"as an AI\". Don't narrate " +
-    "that you are a simulation. Respond as the persona to the situation.";
+/**
+ * The reaction-mode system prompt. Exported (rather than inlined in
+ * buildReactionPrompt) so the `talk` subcommand can reuse the exact
+ * same persona framing without duplicating the text — talk appends a
+ * conversation-mode release clause that lifts the JSON requirement.
+ */
+export const REACTION_SYSTEM_PROMPT =
+  "You are one participant in a swarm simulation. Your identity is fixed — " +
+  "you react AS this persona, in this persona's voice. You see the input " +
+  "document and the recent reactions of other participants (the feed). " +
+  "You do NOT see other participants' private stance or interest deltas.\n\n" +
+  "Each round you emit ONE reaction: a short statement in your voice " +
+  "(1–4 sentences, plausibly something this persona might say in " +
+  "response to the current state of play), plus sparse stance and interest " +
+  "updates on topics you chose to move on this round.\n\n" +
+  "Output STRICT JSON. A single object. No markdown code fence. No prose " +
+  "before or after. Keys:\n" +
+  '  text: string — your reaction in your voice\n' +
+  '  stance_delta: object — topic → delta in −1..+1. Sparse: only topics ' +
+  'you meaningfully moved. Omit topics you did not move. Values are DELTAS, ' +
+  'not absolute.\n' +
+  '  interest_delta: object — same topic keys or new ones, → delta in −1..+1. ' +
+  'Same sparse semantics.\n\n' +
+  "Voice guidance: stay in character. Don't say \"as an AI\". Don't narrate " +
+  "that you are a simulation. Respond as the persona to the situation.";
 
+/**
+ * The persona identity block — bio, voice cues, current stance and
+ * interest, staked topics. Shared verbatim between the round loop's
+ * reaction prompt and the `talk` / `council` subcommands so persona
+ * framing never forks.
+ */
+export function buildPersonaIdentityBlock(persona: Persona): string {
   const topicsKnown = unionTopicKeys(persona);
   const stanceSummary = Object.entries(persona.stance)
     .map(([t, v]) => `${t}=${v.toFixed(2)}`)
@@ -312,20 +319,32 @@ function buildReactionPrompt(
     .map(([t, v]) => `${t}=${v.toFixed(2)}`)
     .join(", ") || "(none yet)";
 
-  const user =
+  return (
     `YOU ARE: ${persona.name}\n` +
     `BIO: ${persona.bio}\n` +
     `VOICE CUES: ${persona.style_markers.join(" • ")}\n` +
     `YOUR CURRENT STANCE: ${stanceSummary}\n` +
     `YOUR CURRENT INTEREST: ${interestSummary}\n` +
-    `TOPICS YOU'VE STAKED: ${topicsKnown.join(", ") || "(none)"}\n\n` +
+    `TOPICS YOU'VE STAKED: ${topicsKnown.join(", ") || "(none)"}`
+  );
+}
+
+function buildReactionPrompt(
+  persona: Persona,
+  roundN: number,
+  feed: string,
+  state: SimulationState,
+): ChatMessage[] {
+  const user =
+    buildPersonaIdentityBlock(persona) +
+    "\n\n" +
     `INPUT DOCUMENT:\n${state.resolved_input_doc}\n\n` +
     `RECENT FEED (other participants' reactions, most recent first):\n` +
     `${feed || "(this is round 1 — no prior reactions yet)"}\n\n` +
     `This is ROUND ${roundN} of ${state.config.n_rounds}. Emit your reaction as JSON.`;
 
   return [
-    { role: "system", content: system },
+    { role: "system", content: REACTION_SYSTEM_PROMPT },
     { role: "user", content: user },
   ];
 }

@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "license": "AGPL-3.0-only",
   "description": "Lightweight swarm-simulation engine — persona reactions to input documents, streamed live.",
   "scripts": {
     "start": "bun src/index.ts",

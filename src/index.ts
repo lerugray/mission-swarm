@@ -28,8 +28,21 @@ import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import { generateAudience } from "./audience-generator";
+import {
+  createDryRunCouncilTakeProvider,
+  createDryRunSynthesisProvider,
+  persistCouncil,
+  runCouncil,
+  type CouncilRecord,
+} from "./council";
 import { generatePersonas } from "./personas";
 import { resolveProvider } from "./providers/registry";
+import {
+  createDryRunTalkProvider,
+  nextTranscriptPath,
+  resolvePersona,
+  runTalkSession,
+} from "./talk";
 import type {
   LLMProvider,
   ChatMessage,
@@ -46,6 +59,7 @@ import {
 import { summarizeSimulation } from "./summary";
 import type {
   AudienceProfile,
+  Persona,
   Reaction,
   ReactionEvent,
   SimulationState,
@@ -61,6 +75,8 @@ const KNOWN_SUBCOMMANDS = new Set([
   "list-audiences",
   "list-sims",
   "summarize",
+  "talk",
+  "council",
   "new-audience",
   "help",
 ]);
@@ -79,6 +95,8 @@ Usage:
   bun src/index.ts list-audiences            Show available audience profiles
   bun src/index.ts list-sims                 Show past simulations in the sims dir
   bun src/index.ts summarize <sim>           Summarize a completed simulation
+  bun src/index.ts talk <sim> <persona>      Converse with a persona from a completed simulation
+  bun src/index.ts council "<question>"      Ask a persona council a question, get a synthesis
   bun src/index.ts new-audience [flags]      Generate a new audience profile (LLM-assisted)
   bun src/index.ts help                      Show this message
 
@@ -130,6 +148,38 @@ Flags for 'summarize':
   --dry-run                       Use a canned summary — no LLM call. Useful for
                                   verifying CLI wiring.
   --stdout                        Also print the full summary to stdout.
+
+Flags for 'talk':
+  <sim>                           REQUIRED. Sim-id, sim directory, or state.json path.
+  <persona>                       REQUIRED. Persona id (exact) or name (case-insensitive).
+                                  On a miss, available personas are listed.
+  --sims-dir <path>               Where to resolve sim-ids (default: ./simulations
+                                  or MISSIONSWARM_SIMS_DIR).
+  --provider <k>                  openrouter | ollama | claude (default: env detection).
+  --model <id>                    Override MISSIONSWARM_LLM_MODEL for this session.
+  --dry-run                       Canned conversational replies — no LLM calls.
+
+  Chat loop: type messages at the you> prompt; /quit (or EOF) exits.
+  Transcript appends to <sim-dir>/talks/<persona>-<n>.md.
+
+Flags for 'council':
+  "<question>"                    REQUIRED. The question to put to the council.
+  --audience <id>                 Generate fresh personas from this audience profile.
+  --from-sim <sim-id>             Use a completed sim's evolved personas instead
+                                  (default all, capped at 8).
+                                  Exactly ONE of --audience / --from-sim is required.
+  --personas <n>                  Voice count (default 5 for --audience; limits
+                                  --from-sim selection, still capped at 8).
+  --sims-dir <path>               Sims dir for --from-sim resolution + output
+                                  (default: ./simulations or MISSIONSWARM_SIMS_DIR).
+  --provider <k>                  openrouter | ollama | claude (default: env detection).
+  --model <id>                    Override MISSIONSWARM_LLM_MODEL for this run.
+  --dry-run                       Canned takes + canned synthesis — no LLM calls.
+
+  Each voice answers independently (no shared context, no deliberation);
+  a separate synthesis call produces "Where they agree" / "Where they
+  differ" / "Bottom line". Output persists under
+  <sims-dir>/council-<timestamp>/ (council.json + council.md).
 
 Flags for 'new-audience':
   --id <id>                       REQUIRED. Slug-form id; becomes filename + audience id.
@@ -196,6 +246,10 @@ async function main(): Promise<number> {
       return listSimsCmd(rest);
     case "summarize":
       return summarizeCmd(rest);
+    case "talk":
+      return talkCmd(rest);
+    case "council":
+      return councilCmd(rest);
     case "new-audience":
       return newAudienceCmd(rest);
     case "help":
@@ -704,6 +758,383 @@ async function writeAtomic(path: string, content: string): Promise<void> {
   const tmp = `${path}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   await writeFile(tmp, content, "utf8");
   await rename(tmp, path);
+}
+
+/** Resolve a sim positional (id / dir / state.json path) and parse its state. */
+async function loadSimulationState(
+  positional: string,
+  simsDir: string,
+): Promise<{ state: SimulationState; simDir: string }> {
+  const { statePath, simDir } = await resolveSimulationPaths(
+    positional,
+    simsDir,
+  );
+  const raw = await readFile(statePath, "utf8");
+  const state = JSON.parse(raw) as SimulationState;
+  return { state, simDir };
+}
+
+// ─────────────────────────────────────────────────────────────
+// `talk`
+// ─────────────────────────────────────────────────────────────
+
+interface TalkFlags {
+  positionals: string[];
+  simsDir?: string;
+  model?: string;
+  provider?: ProviderKind;
+  dryRun: boolean;
+}
+
+export function parseTalkFlags(argv: string[]): TalkFlags {
+  const f: TalkFlags = { positionals: [], dryRun: false };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--dry-run") { f.dryRun = true; continue; }
+    if (!arg.startsWith("--")) {
+      f.positionals.push(arg);
+      continue;
+    }
+    let key: string;
+    let val: string | undefined;
+    const eq = arg.indexOf("=");
+    if (eq >= 0) {
+      key = arg.slice(2, eq);
+      val = arg.slice(eq + 1);
+    } else {
+      key = arg.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) { val = next; i++; }
+    }
+    switch (key) {
+      case "sims-dir":
+        if (!val) console.error("--sims-dir requires a path");
+        else f.simsDir = val;
+        break;
+      case "model":
+        if (val === undefined) console.error("--model requires a value");
+        else f.model = val;
+        break;
+      case "provider": {
+        if (!val) {
+          console.error("--provider requires openrouter, ollama, or claude");
+          break;
+        }
+        const k = val.trim().toLowerCase() as ProviderKind;
+        if (!(VALID_PROVIDER_KINDS as readonly string[]).includes(k)) {
+          console.error(
+            `Unknown --provider ${val} (expected ${VALID_PROVIDER_KINDS.join(", ")})`,
+          );
+          break;
+        }
+        f.provider = k;
+        break;
+      }
+      default:
+        console.error(`Unknown flag: --${key}`);
+    }
+  }
+  return f;
+}
+
+export async function talkCmd(argv: string[]): Promise<number> {
+  const flags = parseTalkFlags(argv);
+  const [simArg, personaArg] = flags.positionals;
+  if (!simArg || !personaArg) {
+    console.error(
+      "Usage: bun src/index.ts talk <sim-id> <persona-name-or-id> [--dry-run]",
+    );
+    return 2;
+  }
+
+  const simsDir = flags.simsDir ?? DEFAULT_SIMS_DIR;
+  let state: SimulationState;
+  let simDir: string;
+  try {
+    ({ state, simDir } = await loadSimulationState(simArg, simsDir));
+  } catch (e) {
+    console.error(`talk: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+
+  const resolution = resolvePersona(state.personas, personaArg);
+  if (!resolution.ok) {
+    console.error(
+      `talk: no persona matching '${personaArg}' in ${state.id}. Available:`,
+    );
+    for (const p of resolution.available) {
+      console.error(`  ${p.id.padEnd(40)}  ${p.name}`);
+    }
+    return 1;
+  }
+  const persona = resolution.persona;
+
+  const provider = flags.dryRun
+    ? createDryRunTalkProvider()
+    : resolveProvider({
+        ...(flags.model ? { modelOverride: flags.model } : {}),
+        ...(flags.provider ? { forceKind: flags.provider } : {}),
+      });
+
+  const transcriptPath = nextTranscriptPath(simDir, persona);
+  process.stderr.write(
+    `[missionswarm] talk · sim=${state.id} · persona=${persona.name} ` +
+      `(${persona.id}) · provider=${provider.kind}` +
+      `${flags.dryRun ? " (dry-run)" : ""} · transcript=${transcriptPath}\n`,
+  );
+
+  const exchanges = await runTalkSession({
+    state,
+    persona,
+    provider,
+    transcriptPath,
+    ...(flags.model ? { chatOptions: { model: flags.model } } : {}),
+  });
+  process.stderr.write(
+    `[missionswarm] talk ended · ${exchanges} exchange(s) · ` +
+      `transcript: ${transcriptPath}\n`,
+  );
+  return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// `council`
+// ─────────────────────────────────────────────────────────────
+
+const COUNCIL_FROM_SIM_CAP = 8;
+const COUNCIL_DEFAULT_FRESH_PERSONAS = 5;
+
+interface CouncilFlags {
+  question?: string;
+  audience?: string;
+  fromSim?: string;
+  personas?: number;
+  simsDir?: string;
+  model?: string;
+  provider?: ProviderKind;
+  dryRun: boolean;
+}
+
+export function parseCouncilFlags(argv: string[]): CouncilFlags {
+  const f: CouncilFlags = { dryRun: false };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--dry-run") { f.dryRun = true; continue; }
+    if (!arg.startsWith("--")) {
+      if (f.question !== undefined) {
+        console.error(`council: multiple positional args, ignoring ${arg}`);
+        continue;
+      }
+      f.question = arg;
+      continue;
+    }
+    let key: string;
+    let val: string | undefined;
+    const eq = arg.indexOf("=");
+    if (eq >= 0) {
+      key = arg.slice(2, eq);
+      val = arg.slice(eq + 1);
+    } else {
+      key = arg.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) { val = next; i++; }
+    }
+    switch (key) {
+      case "audience":
+        if (!val) console.error("--audience requires a profile id");
+        else f.audience = val;
+        break;
+      case "from-sim":
+        if (!val) console.error("--from-sim requires a sim-id");
+        else f.fromSim = val;
+        break;
+      case "personas": {
+        if (!val) { console.error("--personas requires a number"); break; }
+        const n = parseInt(val, 10);
+        f.personas = Math.max(1, Number.isFinite(n) ? n : 0);
+        break;
+      }
+      case "sims-dir":
+        if (!val) console.error("--sims-dir requires a path");
+        else f.simsDir = val;
+        break;
+      case "model":
+        if (val === undefined) console.error("--model requires a value");
+        else f.model = val;
+        break;
+      case "provider": {
+        if (!val) {
+          console.error("--provider requires openrouter, ollama, or claude");
+          break;
+        }
+        const k = val.trim().toLowerCase() as ProviderKind;
+        if (!(VALID_PROVIDER_KINDS as readonly string[]).includes(k)) {
+          console.error(
+            `Unknown --provider ${val} (expected ${VALID_PROVIDER_KINDS.join(", ")})`,
+          );
+          break;
+        }
+        f.provider = k;
+        break;
+      }
+      default:
+        console.error(`Unknown flag: --${key}`);
+    }
+  }
+  return f;
+}
+
+function generateCouncilId(): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `council-${stamp}-${rand}`;
+}
+
+export async function councilCmd(argv: string[]): Promise<number> {
+  const flags = parseCouncilFlags(argv);
+  if (!flags.question || flags.question.trim() === "") {
+    console.error("council: positional \"<question>\" argument required");
+    console.error(
+      'Usage: bun src/index.ts council "<question>" ' +
+        "(--audience <id> | --from-sim <sim-id>) [--personas N] [--dry-run]",
+    );
+    return 2;
+  }
+  const hasAudience = flags.audience !== undefined;
+  const hasFromSim = flags.fromSim !== undefined;
+  if (hasAudience === hasFromSim) {
+    console.error(
+      "council: exactly ONE of --audience <id> or --from-sim <sim-id> is required",
+    );
+    return 2;
+  }
+
+  const simsDir = flags.simsDir ?? DEFAULT_SIMS_DIR;
+  const councilId = generateCouncilId();
+  const question = flags.question.trim();
+
+  let personas: Persona[];
+  let documentContext: string | undefined;
+  let source: CouncilRecord["source"];
+
+  try {
+    if (hasFromSim) {
+      const { state } = await loadSimulationState(flags.fromSim!, simsDir);
+      // Evolved personas — post-run stances. Default all, cap 8;
+      // --personas can narrow further but never exceeds the cap.
+      const limit = Math.min(
+        flags.personas ?? COUNCIL_FROM_SIM_CAP,
+        COUNCIL_FROM_SIM_CAP,
+      );
+      personas = state.personas.slice(0, limit);
+      documentContext = state.resolved_input_doc;
+      source = {
+        kind: "from-sim",
+        sim_id: state.id,
+        n_personas: personas.length,
+      };
+    } else {
+      const audience = await loadAudience(flags.audience!);
+      const n = flags.personas ?? COUNCIL_DEFAULT_FRESH_PERSONAS;
+      const genProvider = flags.dryRun
+        ? createDryRunProvider()
+        : resolveProvider({
+            ...(flags.model ? { modelOverride: flags.model } : {}),
+            forceKind: flags.provider ?? "openrouter",
+          });
+      process.stderr.write(
+        `[missionswarm] council ${councilId} · generating ${n} fresh ` +
+          `personas from audience=${audience.id} · provider=` +
+          `${genProvider.kind}${flags.dryRun ? " (dry-run)" : ""}\n`,
+      );
+      personas = await generatePersonas({
+        simulationId: councilId,
+        audience,
+        inputDoc: question,
+        nAgents: n,
+        provider: genProvider,
+        ...(flags.model ? { chatOptions: { model: flags.model } } : {}),
+      });
+      source = {
+        kind: "audience",
+        audience_id: audience.id,
+        n_personas: personas.length,
+      };
+    }
+  } catch (e) {
+    console.error(`council: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+
+  if (personas.length === 0) {
+    console.error("council: no personas available");
+    return 1;
+  }
+
+  const takeProvider = flags.dryRun
+    ? createDryRunCouncilTakeProvider()
+    : resolveProvider({
+        ...(flags.model ? { modelOverride: flags.model } : {}),
+        ...(flags.provider ? { forceKind: flags.provider } : {}),
+      });
+  // Synthesis goes through the same provider path summarize uses
+  // (env-detected unless --provider forces a kind).
+  const synthesisProvider = flags.dryRun
+    ? createDryRunSynthesisProvider()
+    : resolveProvider({
+        ...(flags.model ? { modelOverride: flags.model } : {}),
+        ...(flags.provider ? { forceKind: flags.provider } : {}),
+      });
+
+  process.stderr.write(
+    `[missionswarm] council ${councilId} · ${personas.length} voices · ` +
+      `independent parallel takes · provider=${takeProvider.kind}` +
+      `${flags.dryRun ? " (dry-run)" : ""}\n`,
+  );
+
+  const result = await runCouncil({
+    personas,
+    question,
+    takeProvider,
+    synthesisProvider,
+    ...(flags.model ? { chatOptions: { model: flags.model } } : {}),
+    ...(documentContext ? { documentContext } : {}),
+  });
+
+  for (const f of result.failures) {
+    process.stderr.write(
+      `[missionswarm] council voice failed (excluded): ` +
+        `${f.persona_name} — ${f.error}\n`,
+    );
+  }
+
+  const record: CouncilRecord = {
+    id: councilId,
+    question,
+    source,
+    created_at: new Date().toISOString(),
+    takes: result.takes,
+    failures: result.failures,
+    synthesis: result.synthesis,
+    ...(result.note ? { note: result.note } : {}),
+  };
+  const outDir = await persistCouncil(simsDir, record);
+
+  if (result.synthesis !== null) {
+    process.stdout.write(result.synthesis + "\n");
+  } else {
+    // Too few successful answers to synthesize — print what we have
+    // plus the note. Never fabricate over failed voices.
+    for (const t of result.takes) {
+      process.stdout.write(`### ${t.persona_name}\n${t.text}\n\n`);
+    }
+    process.stdout.write(`${result.note}\n`);
+  }
+  process.stderr.write(
+    `[missionswarm] council persisted to ${outDir} ` +
+      `(${result.takes.length} takes, ${result.failures.length} failed)\n`,
+  );
+  return result.takes.length === 0 ? 1 : 0;
 }
 
 // ─────────────────────────────────────────────────────────────

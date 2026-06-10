@@ -112,13 +112,55 @@ path runs fully local; nothing leaves your machine on that path.
 
 ## Setup
 
+Requires [Bun](https://bun.sh) >= 1.1.
+
 ```bash
 git clone https://github.com/lerugray/mission-swarm.git
 cd mission-swarm
 bun install
 cp .env.example .env   # configure OPENROUTER_API_KEY or Ollama endpoint
-bun src/index.ts --help
+bun src/index.ts help
 ```
+
+## Usage
+
+First run, no API key needed — `--dry-run` uses canned responses so
+you can verify the wiring end-to-end without an LLM:
+
+```bash
+bun src/index.ts run --input ./brief.md --audience kriegspiel \
+  --personas 4 --rounds 2 --dry-run
+```
+
+Real run — set `OPENROUTER_API_KEY` (or `OLLAMA_BASE_URL` for fully
+local) and a model id, in `.env` or the environment:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export MISSIONSWARM_LLM_MODEL=anthropic/claude-sonnet-4-6
+
+bun src/index.ts run --input ./brief.md --audience kriegspiel
+bun src/index.ts list-sims                  # find your simulation id
+bun src/index.ts summarize <sim-id>         # designer-readable summary
+```
+
+After a simulation completes, two more surfaces open up:
+
+```bash
+# Converse with one persona from the completed run — their bio,
+# evolved stance, and own prior reactions carry into the chat.
+# /quit exits; transcript lands in simulations/<id>/talks/.
+bun src/index.ts talk <sim-id> "Col. Irina Volkov"
+
+# Put a question to a council of voices. Each answers independently
+# (no deliberation, no cross-talk); a separate synthesis reports
+# where they agree, where they differ, and the bottom line.
+bun src/index.ts council "Does this announcement land?" --from-sim <sim-id>
+bun src/index.ts council "Does this announcement land?" --audience kriegspiel
+```
+
+Both `talk` and `council` accept `--dry-run` too. See
+`bun src/index.ts help` for every flag.
 
 ## Sibling tools
 
@@ -133,3 +175,13 @@ on your disk, your keys for paid providers, no SaaS layer.
   grounded.
 - **[mission-bullet-oss](https://github.com/lerugray/mission-bullet-oss)**:
   AI-assisted bullet journal in the Ryder Carroll method.
+
+## License
+
+mission-swarm is free software: a free, open-source tool, not a
+commercial product. It is released under the GNU Affero General
+Public License, version 3 (AGPL-3.0). You can redistribute it and/or
+modify it under the terms of that license; it comes with no warranty.
+See [LICENSE](LICENSE) for the full text.
+
+Copyright (C) 2026 Ray Weiss.
